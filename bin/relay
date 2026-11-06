@@ -44,7 +44,14 @@ DEFAULTS = {
     "pending_slack": 600,
     "timeout": 900,
     "notify_done": True,
-    "dangerous_regex": r"rm -rf|force.?push|drop table|deploy|prod|删除|付款",
+    # 只拦不可逆、无法撤销的操作。部署/上线/删除这类可回滚动作交给 caution_regex
+    # 只做标注——用正则猜「是命令还是否定句」做不到，'不要删除' 会被误判成危险指令。
+    "dangerous_regex": (r"rm\s+-rf\s+/|rm\s+-rf\s+~|"
+                        r"(git\s+push|push)\s+.*(--force|-f)\b|force.?push|"
+                        r"drop\s+(table|database|schema)|truncate\s+table|"
+                        r"git\s+reset\s+--hard|"
+                        r"mkfs\.|dd\s+if=.*of=/dev/|>\s*/dev/sd"),
+    "caution_regex": r"deploy|部署|上线|发布|prod|production|线上|生产",
     "worker_tail_chars": 2000,
     "escalate_tail_chars": 1500,
     "imap_poll_interval": 30,
