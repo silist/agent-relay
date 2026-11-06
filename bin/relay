@@ -479,6 +479,32 @@ def poll_mail(state, cfg):
                 pass
 
 
+def looks_like_request(text):
+    """判断 worker 的 Stop 文本是在「请求决策」还是单纯「报告在等」。
+
+    background_tasks 只能说明「有后台任务在跑」，不能说明「不需要决策」。
+    实测 mp-sql 挂了 monitor 等审查，同时明确在等主 agent review —— 这是真请求，
+    被当成空转挡掉后，它一直干等，orchestrator 完全不知道。
+
+    这里用保守的措辞匹配：宁可多派发一次，也不要漏掉请求。
+    漏派的代价是 worker 静默卡死；多派的代价只是一次 orchestration 调用。
+    """
+    if not text:
+        return False
+    t = text.lower()
+    pats = (
+        r"等待.{0,12}(审查|审阅|review|复核|确认|决定|决策|授权|回复|指示)",
+        r"(等|请|需要).{0,10}(主 ?agent|orchestrator|你).{0,10}(审查|审阅|review|确认|决定)",
+        r"(请|需要|请求).{0,6}(审查|审阅|review|确认|批准|授权)",
+        r"扣在|卡在|阻塞在|无法继续|需要你|等你(确认|决定|回复)",
+        r"await(ing)? .{0,20}(review|confirmation|approval|decision)",
+        r"(pending|waiting for).{0,20}(review|approval|confirmation)",
+        r"(等|待).{0,8}(本次|此次)?\s*(review|审查|审阅|复核|验收|确认)",
+        r"(ask|need).{0,15}(approval|decision|review)",
+    )
+    return any(re.search(p, t) for p in pats)
+
+
 # ---------------------------------------------------------------- hook 入口
 
 
@@ -571,17 +597,24 @@ def cmd_event(src):
             dropped("empty-message", pane_label(pane))
             return 0
 
-        # 后台任务还在跑时，Stop 只是「本轮思考结束」，不是「等人决策」。
+        # 后台任务还在跑时，Stop 通常只是「本轮思考结束」，不是「等人决策」。
         # Claude 的 Stop payload 带 background_tasks（Monitor / 后台 shell 等），
-        # 实测它非空的轮次全是空转：worker 等备份/CI，orchestrator 每轮回一句
-        # 「继续等」，5 轮烧掉高耗模型的调用。这是确定性信号，不需要模型判断。
+        # 实测它非空的轮次大多是空转：worker 等备份/CI，orchestrator 每轮回一句
+        # 「继续等」，5 轮烧掉高耗模型的调用。
+        #
+        # 但「有后台任务」≠「不需要决策」。mp-sql 挂了 monitor 等审查的同时，
+        # 明确在等主 agent review diff —— 那是真请求，被当成空转挡掉后它会干等。
+        # 所以再看文本：像请求就照常派发，只是报告状态才进 pending。
         bg = payload.get("background_tasks") or []
         if bg and cfg.get("skip_background_tasks", True):
-            ensure_dirs()
-            keep_latest_pending(pane, pane_label(pane),
-                                {"pane": pane, "src": src, "text": text})
-            dropped("background-tasks", pane_label(pane))
-            return 0
+            if looks_like_request(text):
+                log(f"{pane_label(pane)} 有后台任务但在请求决策，照常派发")
+            else:
+                ensure_dirs()
+                keep_latest_pending(pane, pane_label(pane),
+                                    {"pane": pane, "src": src, "text": text})
+                dropped("background-tasks", pane_label(pane))
+                return 0
 
         ensure_dirs()
         ms = int(time.time() * 1000)
@@ -727,7 +760,12 @@ def check_pending(state, cfg):
             os.unlink(path)
             continue
         slack = throttle_slack if ev.get("reason") == "throttled" else default_slack
-        if now - float(ev.get("ts", 0)) < slack:
+        # 用首次进入 pending 的时间计时，不能用最后一次覆盖的时间。
+        # 踩过的坑：worker 每停一次就覆盖一次 pending 并写入新的 ts，倒计时
+        # 跟着归零，而它的 Stop 间隔（2~8 分钟）永远小于 slack（3600s），
+        # 于是兜底永远不到期——不是「等一小时」，是「永远等不到」。
+        since = float(ev.get("first_ts") or ev.get("ts", 0))
+        if now - since < slack:
             continue
         worker = ev.get("worker", "unknown")
         # 已不在白名单 / 已被移除的 worker，其兜底事件直接丢弃
@@ -754,11 +792,20 @@ def keep_latest_pending(pane, worker, ev, reason="background-tasks"):
 
     等待期间每次 Stop 都会进来，全留着会在兜底时一次性补派一串，
     又把 orchestrator 打爆；只留最新一条就够了——它包含最新的状态。
+
+    但 first_ts 必须沿用最早那条：兜底是「等够久还没派发就补一次」，
+    计时一旦被覆盖重置，频繁 Stop 的 worker 就永远等不到补派。
     """
     ensure_dirs()
     tag = pane.lstrip("%")
+    first_ts = time.time()
     for old in os.listdir(PENDING):
         if old.endswith(f"-{tag}.json"):
+            try:
+                prev = load_json(os.path.join(PENDING, old), {})
+                first_ts = float(prev.get("first_ts") or prev.get("ts") or first_ts)
+            except Exception:
+                pass
             try:
                 os.unlink(os.path.join(PENDING, old))
             except FileNotFoundError:
@@ -766,7 +813,8 @@ def keep_latest_pending(pane, worker, ev, reason="background-tasks"):
     ms = int(time.time() * 1000)
     save_json(os.path.join(PENDING, f"{ms:013d}-{tag}.json"),
               {"worker": worker, "pane": pane, "src": ev.get("src", ""),
-               "text": ev.get("text", ""), "reason": reason, "ts": ms / 1000})
+               "text": ev.get("text", ""), "reason": reason,
+               "ts": ms / 1000, "first_ts": first_ts})
 
 
 def dispatch(state, cfg):
