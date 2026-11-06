@@ -9,3 +9,9 @@ inbox/
 outbox/
 pending/
 dropped.log
+
+# Python 构建产物
+build/
+dist/
+*.egg-info/
+.venv/

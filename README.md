@@ -60,14 +60,37 @@ orchestrator 通过执行 `relay decide/done/escalate` 回复，命令只往 `ou
 
 ## 安装
 
+需要 Python 3.8+（仅标准库，无第三方依赖）。
+
+### 方式一：单文件（推荐）
+
+hook 里写的是 `relay event --src claude`，需要一个**稳定出现在 PATH 里**的可执行文件。
+自己放一份最省心，升级时覆盖即可：
+
 ```bash
-git clone https://github.com/<you>/agent-relay.git
 mkdir -p ~/bin ~/.agent-relay
-cp agent-relay/bin/relay ~/bin/relay && chmod +x ~/bin/relay
-cp agent-relay/config.example.json ~/.agent-relay/config.json
+curl -o ~/bin/relay https://raw.githubusercontent.com/silist/agent-relay/master/bin/relay
+chmod +x ~/bin/relay
+curl -o ~/.agent-relay/config.json https://raw.githubusercontent.com/silist/agent-relay/master/config.example.json
 chmod 600 ~/.agent-relay/config.json          # 会存 SMTP 授权码
 $EDITOR ~/.agent-relay/config.json
 ```
+
+### 方式二：pip / uv
+
+```bash
+pip install git+https://github.com/silist/agent-relay
+# 或
+uv tool install git+https://github.com/silist/agent-relay
+```
+
+也可以 `git clone` 后 `pip install .` 本地安装。
+
+> **不要用 `uvx` 跑 daemon 或写进 hook。** `uvx` 每次运行都从缓存里取环境，
+> 路径随版本变化，而 hook 里的命令是写死的。`uvx` 只适合临时试用：
+> `uvx --from git+https://github.com/silist/agent-relay relay status`
+
+### 初始化
 
 在 orchestrator 的 pane 里执行 `relay init`，会自动填入当前 pane 的 `orchestrator_pane`。
 然后在 worker 的 pane 里执行 `relay register`。
@@ -250,7 +273,11 @@ Message-ID 只出现在发给你的那封信里，伪造者无从得知。
 
 ```bash
 python3 -c "import ast;ast.parse(open('bin/relay').read())"   # 唯一的语法检查
+pip install -e .                                              # 需要可编辑安装时
 ```
+
+`bin/relay` 是唯一权威源。`pyproject.toml` 用 `script-files` 把它按原样装进
+`bin/`，不为了打包把单文件拆成模块再维护两份。
 
 没有测试框架。验证方式见 `AGENTS.md`——关键是**状态类测试必须隔离 `HOME`**，
 否则会把测试数据写进真实的 `~/.agent-relay/state.json`。
