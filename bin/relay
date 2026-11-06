@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""relay — 多 agent tmux 编排与人工升级中继（单文件，仅标准库）。
+"""agent-relay — 多 agent tmux 编排与人工升级中继（单文件，仅标准库）。
 
   worker 停下 --hook--> relay event --> ~/.agent-relay/inbox/
   relay daemon 每秒轮询：一次只把一条事件 paste 给 orchestrator pane
@@ -1094,7 +1094,7 @@ def cmd_status():
     return 0
 
 
-USAGE = """relay — 多 agent tmux 编排中继
+USAGE = """agent-relay — 多 agent tmux 编排中继
 
   relay init                       写入 ~/.agent-relay/config.json（在 orchestrator pane 中执行）
   relay register [pane]            把当前/指定 pane 注册为 worker（在 worker pane 中执行）
