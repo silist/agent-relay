@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.log
+
+# 运行时状态（含凭据与 worker 输出，绝不入库）
+config.json
+state.json
+inbox/
+outbox/
+pending/
+dropped.log

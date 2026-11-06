@@ -1,0 +1,28 @@
+{
+  "orchestrator_pane": "%N",
+  "worker_panes": [],
+  "channels": [],
+  "feishu_webhook": "",
+  "email": {
+    "host": "smtp.qq.com",
+    "port": 465,
+    "user": "you@example.com",
+    "password": "REPLACE_ME",
+    "to": "you@example.com",
+    "imap_host": "imap.qq.com",
+    "imap_port": 993,
+    "from_whitelist": []
+  },
+  "max_rounds": 64,
+  "timeout": 900,
+  "min_dispatch_interval": 300,
+  "skip_background_tasks": true,
+  "pending_slack": 3600,
+  "notify_done": true,
+  "dangerous_regex": "rm\\s+-rf\\s+/|rm\\s+-rf\\s+~|(git\\s+push|push)\\s+.*(--force|-f)\\b|force.?push|drop\\s+(table|database|schema)|truncate\\s+table|git\\s+reset\\s+--hard|mkfs\\.|dd\\s+if=.*of=/dev/|>\\s*/dev/sd",
+  "caution_regex": "deploy|部署|上线|发布|prod|production|线上|生产",
+  "worker_tail_chars": 2000,
+  "escalate_tail_chars": 1500,
+  "imap_poll_interval": 30,
+  "mail_reply_enabled": false
+}

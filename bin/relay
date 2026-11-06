@@ -1,0 +1,1025 @@
+#!/usr/bin/env python3
+"""relay — 多 agent tmux 编排与人工升级中继（单文件，仅标准库）。
+
+  worker 停下 --hook--> relay event --> ~/.agent-relay/inbox/
+  relay daemon 每秒轮询：一次只把一条事件 paste 给 orchestrator pane
+  orchestrator 执行 relay decide|done|escalate --> outbox/
+  daemon 应用 outbox：decide 回灌 worker；escalate 走飞书/邮件通知人
+  人执行 relay answer <worker> [决策] --> 回灌 worker
+"""
+
+import json
+import os
+import re
+import signal
+import smtplib
+import subprocess
+import sys
+import time
+import traceback
+import urllib.request
+from email.message import EmailMessage
+
+HOME = os.path.expanduser("~")
+BASE = os.path.join(HOME, ".agent-relay")
+CONFIG_PATH = os.path.join(BASE, "config.json")
+STATE_PATH = os.path.join(BASE, "state.json")
+INBOX = os.path.join(BASE, "inbox")
+PENDING = os.path.join(BASE, "pending")
+OUTBOX = os.path.join(BASE, "outbox")
+DROPPED = os.path.join(BASE, "dropped.log")
+LOG = os.path.join(BASE, "relay.log")
+BUF = "relay"
+
+DEFAULTS = {
+    "orchestrator_pane": "",
+    "worker_panes": [],
+    "channels": [],
+    "feishu_webhook": "",
+    "email": {"host": "", "port": 465, "user": "", "password": "", "to": "",
+              "imap_host": "", "imap_port": 993, "from_whitelist": []},
+    "max_rounds": 64,
+    "min_dispatch_interval": 120,
+    "skip_background_tasks": True,
+    "pending_slack": 600,
+    "timeout": 900,
+    "notify_done": True,
+    "dangerous_regex": r"rm -rf|force.?push|drop table|deploy|prod|删除|付款",
+    "worker_tail_chars": 2000,
+    "escalate_tail_chars": 1500,
+    "imap_poll_interval": 30,
+    "mail_reply_enabled": False,
+}
+
+
+# ---------------------------------------------------------------- 基础设施
+
+
+def ensure_dirs():
+    for d in (BASE, INBOX, PENDING, OUTBOX):
+        os.makedirs(d, exist_ok=True)
+
+
+def load_json(path, default):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return default
+    except Exception as exc:
+        log(f"{path} 读取失败，用默认值: {exc}")
+        return default
+
+
+def save_json(path, obj):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def load_config():
+    cfg = dict(DEFAULTS)
+    cfg.update(load_json(CONFIG_PATH, {}))
+    return cfg
+
+
+def load_state():
+    st = load_json(STATE_PATH, {})
+    st.setdefault("workers", {})
+    st.setdefault("in_flight", None)
+    return st
+
+
+def save_state(state):
+    save_json(STATE_PATH, state)
+
+
+def log(msg):
+    """失败一律写 stderr + 日志文件，不静默。"""
+    line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
+    print(line, file=sys.stderr, flush=True)
+    try:
+        with open(LOG, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def dropped(reason, worker):
+    try:
+        with open(DROPPED, "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{reason}\t{worker}\n")
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------- tmux
+
+
+def tmux(*args):
+    return subprocess.run(["tmux", *args], capture_output=True, text=True)
+
+
+def pane_label(pane):
+    """worker 名：单窗口单 pane 用 session 名，否则补 window.pane 索引。"""
+    if not pane:
+        return "unknown"
+    r = tmux("display-message", "-p", "-t", pane,
+             "#{session_name}\t#{window_index}\t#{pane_index}\t#{session_windows}\t#{window_panes}")
+    if r.returncode != 0:
+        return pane
+    parts = r.stdout.rstrip("\n").split("\t")
+    if len(parts) != 5 or not all(parts):
+        # pane 已消失时 tmux 仍返回 0 和空字段，此时退回 pane id
+        return pane
+    sess, win, pidx, nwin, npane = parts
+    if nwin == "1" and npane == "1":
+        return sess
+    return f"{sess}:{pidx}" if nwin == "1" else f"{sess}:{win}.{pidx}"
+
+
+def paste(pane, text):
+    """bracketed paste + Enter。codex TUI 偶尔需要补一次 Enter（见 README 已知限制）。"""
+    if not pane:
+        log("paste 失败：pane 为空")
+        return False
+    try:
+        subprocess.run(["tmux", "load-buffer", "-b", BUF, "-"],
+                       input=text.encode("utf-8"), check=True)
+        r = tmux("paste-buffer", "-p", "-b", BUF, "-t", pane, "-d")
+        if r.returncode != 0:
+            log(f"paste-buffer 失败 pane={pane}: {r.stderr.strip()}")
+            return False
+        time.sleep(0.4)  # 让 TUI 处理完 bracketed paste 再提交
+        r = tmux("send-keys", "-t", pane, "Enter")
+        if r.returncode != 0:
+            log(f"send-keys 失败 pane={pane}: {r.stderr.strip()}")
+            return False
+        return True
+    except Exception as exc:
+        log(f"paste 异常 pane={pane}: {exc}")
+        return False
+
+
+# ---------------------------------------------------------------- 通知
+
+
+def notify(title, body):
+    cfg = load_config()
+    channels = cfg.get("channels") or []
+    if not channels:
+        log(f"未配置通知渠道，仅本地告警：{title}")
+        return False
+    ok = False
+    for ch in channels:
+        try:
+            if ch == "feishu":
+                hook = cfg.get("feishu_webhook") or ""
+                if not hook:
+                    log("channels 含 feishu 但 feishu_webhook 为空")
+                    continue
+                data = json.dumps({"msg_type": "text",
+                                   "content": {"text": f"{title}\n\n{body}"}}).encode()
+                req = urllib.request.Request(hook, data=data,
+                                             headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    log(f"飞书通知已发送 status={resp.status}")
+                ok = True
+            elif ch == "email":
+                e = cfg.get("email") or {}
+                if not all(e.get(k) for k in ("host", "user", "password", "to")):
+                    log("channels 含 email 但配置不完整")
+                    continue
+                msg = EmailMessage()
+                msg["Subject"] = title
+                msg["From"] = e["user"]
+                msg["To"] = e["to"]
+                msg.set_content(body)
+                with smtplib.SMTP_SSL(e["host"], int(e.get("port", 465)), timeout=20) as s:
+                    s.login(e["user"], e["password"])
+                    s.send_message(msg)
+                log("邮件通知已发送")
+                ok = True
+            else:
+                log(f"未知通知渠道: {ch}")
+        except Exception as exc:
+            log(f"通知渠道 {ch} 发送失败: {exc}")
+    return ok
+
+
+def escalate_body(cfg, worker, pane, reason, text, reply_token=""):
+    tail = (text or "")[-int(cfg.get("escalate_tail_chars", 1500)):]
+    how = f"  relay answer {worker} \"<你的决策>\"\n"
+    if reply_token:
+        how = (f"  【推荐】直接回复本邮件，正文即决策（只认白名单发件人）\n"
+               f"  或执行：relay answer {worker} \"<你的决策>\"\n")
+    return (f"worker: {worker} (pane {pane})\n"
+            f"工单: {reply_token or '(无)'}\n"
+            f"原因: {reason}\n\n"
+            f"--- worker 最后输出 ---\n{tail}\n---\n\n"
+            f"回复方式:\n{how}"
+            f"若需直接在 tmux 里接手:\n  relay answer {worker}\n")
+
+
+# ---------------------------------------------------------------- 邮件回灌（IMAP）
+
+
+def imap_conn(cfg):
+    """建 IMAP 连接。凭据缺失或连接失败返回 None 并记日志。"""
+    e = cfg.get("email") or {}
+    host = e.get("imap_host") or ""
+    if not (host and e.get("user") and e.get("password")):
+        return None
+    import imaplib
+    m = imaplib.IMAP4_SSL(host, int(e.get("imap_port", 993)), timeout=20)
+    m.login(e["user"], e["password"])
+    return m
+
+
+def header_raw_text(msg):
+    """把 Subject/From 的原始编码片段拍平，用于取回嵌入的工单号。
+
+    QQ 会把没有空白的 base64 片段误当普通文本，收到后 Subject 变成
+    '=?utf-8?b?...?='；编码串里只含 base64 字符集，所以用纯 base64 片段
+    反解也能还原出工单号。
+    """
+    import base64
+    import re as _re
+    from email.header import decode_header
+    raw = " ".join(str(msg.get(h) or "") for h in ("Subject", "From", "To"))
+    out = []
+    for part, enc in decode_header(raw):
+        if isinstance(part, bytes):
+            # 有序尝试：声明编码优先，再退到 utf-8 / gb18030。
+            # 用 set 会让结果随哈希种子变化，同一封信每次解出的文本都不同。
+            for cs in ([enc] if enc else []) + ["utf-8", "gb18030"]:
+                try:
+                    out.append(part.decode(cs, "strict"))
+                    break
+                except Exception:
+                    continue
+            else:
+                out.append(part.decode("utf-8", "replace"))
+        else:
+            out.append(part)
+            # 被当作文本的 base64 片段
+            for tok in _re.findall(r"=?[A-Za-z0-9+/]{8,}={0,2}", part):
+                if len(tok) % 4:
+                    continue
+                try:
+                    out.append(base64.b64decode(tok).decode("utf-8", "replace"))
+                except Exception:
+                    pass
+    return " ".join(out)
+
+
+def plain_body(msg):
+    """只取 body 第一段纯文本，去掉 quoted 历史与签名。"""
+    import re as _re
+    body = ""
+    for part in msg.walk():
+        if part.get_content_type() != "text/plain":
+            continue
+        if part.get("Content-Disposition", "").startswith("attachment"):
+            continue
+        payload = part.get_payload(decode=True) or b""
+        body = payload.decode(part.get_content_charset() or "utf-8", "replace")
+        break
+    lines = []
+    for line in body.splitlines():
+        s = line.strip()
+        if _re.match(r"^On .* wrote:$", s) or s.startswith("-----原始邮件-----") \
+           or s.startswith("----- Original Message") or s.startswith("发件人:"):
+            break
+        if s.startswith(">"):
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def poll_mail(state, cfg):
+    """扫收件箱里 [relay] 邮件，按发件人白名单把正文回灌给 worker。
+
+    只处理「最近一次升级的工单号」匹配的邮件，且每个工单只消费一次，
+    避免一封旧回复被重复投递。
+    """
+    e = cfg.get("email") or {}
+    allow = [a.strip().lower() for a in (e.get("from_whitelist") or []) if a.strip()]
+    if not allow:
+        return
+    tokens = {w: st.get("reply_token") for w, st in (state.get("workers") or {}).items()
+              if st.get("reply_token") and st.get("status") == "waiting_human"}
+    if not tokens:
+        return
+
+    m = None
+    try:
+        m = imap_conn(cfg)
+        if m is None:
+            return
+        m.select("INBOX")
+        typ, data = m.search(None, '(UNSEEN SUBJECT "[relay]")')
+        ids = data[0].split()
+        for num in ids:
+            typ, d = m.fetch(num, "(RFC822)")
+            import email as _email
+            msg = _email.message_from_bytes(d[0][1])
+            raw = header_raw_text(msg)
+            tokens_lower = {w: t.lower() for w, t in tokens.items()}
+
+            # 发件人白名单：必须用 RFC5322 解析出的地址做**全等**比对。
+            # 子串匹配会让 "user@example.com.evil.com" 这类地址通过。
+            from email.utils import parseaddr
+            sender = parseaddr(str(msg.get("From") or ""))[1].strip().lower()
+            frm = next((a for a in (e.get("from_whitelist") or [])
+                        if a.strip().lower() == sender), "")
+            if not frm:
+                log(f"邮件回灌：发件人不在白名单，忽略。From={sender or '(空)'}")
+                m.store(num, "+FLAGS", "\\Seen")
+                continue
+
+            # 工单号唯一标识本次升级，只认它，不要求主题里带 worker 名：
+            # 中文主题经 QQ 转码后 worker 名可能一起被 base64 包住。
+            worker = next((w for w, t in tokens_lower.items() if t in raw.lower()), None)
+            if worker is None:
+                log(f"邮件回灌：找不到匹配的工单，忽略。headers={raw[:120]}")
+                m.store(num, "+FLAGS", "\\Seen")
+                continue
+
+            # 正文里出现其他工单号 -> 多半是上一封的引用历史，不是本次回复
+            body = plain_body(msg)
+            if any(t in body.lower() for w2, t in tokens_lower.items() if w2 != worker):
+                log(f"邮件回灌：正文含其他工单号，忽略（{worker}）")
+                m.store(num, "+FLAGS", "\\Seen")
+                continue
+            if not body:
+                log(f"邮件回灌：{worker} 的邮件正文为空，忽略")
+                m.store(num, "+FLAGS", "\\Seen")
+                continue
+
+            ms = int(time.time() * 1000)
+            save_json(os.path.join(OUTBOX, f"{ms:013d}-answer.json"),
+                      {"action": "answer", "worker": worker, "text": body,
+                       "src": "email", "from": frm, "ts": ms / 1000})
+            m.store(num, "+FLAGS", "\\Seen")
+            log(f"邮件回灌：已受理 {frm} 对 {worker} 的回复（{len(body)} 字）")
+    except Exception as exc:
+        log(f"邮件回灌轮询失败: {exc}")
+    finally:
+        if m is not None:
+            try:
+                m.logout()
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------- hook 入口
+
+
+def read_transcript_tail(path):
+    """last_assistant_message 缺失时的兜底：取 transcript 最后一条 assistant 文本。"""
+    if not path or not os.path.exists(path):
+        log(f"transcript 兜底不可用: {path or '(空路径)'}")
+        return ""
+    last = ""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if obj.get("type") != "assistant":
+                    continue
+                buf = [b.get("text", "") for b in (obj.get("message") or {}).get("content") or []
+                       if isinstance(b, dict) and b.get("type") == "text"]
+                if buf:
+                    last = "\n".join(buf)
+    except Exception as exc:
+        log(f"transcript 解析失败: {exc}")
+    return last
+
+
+def read_stdin_strict(timeout=3.0):
+    """读 hook 的 stdin，但绝不无限阻塞（阻塞会卡住被 hook 的 agent）。"""
+    try:
+        if sys.stdin.isatty():
+            return ""
+        import select
+        fd = sys.stdin.fileno()
+        if not select.select([fd], [], [], timeout)[0]:
+            log("hook stdin 超时无数据，按空 payload 处理")
+            return ""
+        return sys.stdin.read(500000)
+    except Exception as exc:
+        log(f"读取 hook stdin 失败: {exc}")
+        return ""
+
+
+def cmd_event(src):
+    """hook 入口，永远退出 0，绝不阻塞被 hook 的 agent。"""
+    try:
+        cfg = load_config()
+        payload = {}
+        raw = read_stdin_strict()
+        if raw.strip():
+            try:
+                payload = json.loads(raw)
+            except Exception:
+                payload = {}
+        if not payload:
+            # codex notify 把 JSON 放在最后一个参数
+            for a in reversed(sys.argv):
+                if a.startswith("{"):
+                    try:
+                        payload = json.loads(a)
+                        break
+                    except Exception:
+                        continue
+
+        pane = os.environ.get("TMUX_PANE", "")
+        if not pane:
+            dropped("not-in-tmux", "")
+            return 0
+        orch = cfg.get("orchestrator_pane") or ""
+        if orch and pane == orch:
+            dropped("is-orchestrator", pane_label(pane))
+            return 0
+        # worker_panes 是白名单。本机常年同时跑多个互不相关的 agent 会话
+        # （media-pipeline、remotion 等），若接受任意 pane 的 Stop，它们每次
+        # 停下都会去打扰 orchestrator。空列表 = 没有 worker，全部拒绝。
+        allow = [p for p in (cfg.get("worker_panes") or []) if p]
+        if pane not in allow:
+            dropped("not-in-worker-panes", pane_label(pane))
+            return 0
+
+        if src == "claude":
+            text = payload.get("last_assistant_message") or \
+                read_transcript_tail(payload.get("transcript_path", ""))
+            session = payload.get("session_id", "")
+        else:
+            text = payload.get("last-assistant-message") or ""
+            session = payload.get("thread-id", "")
+
+        if not text.strip():
+            dropped("empty-message", pane_label(pane))
+            return 0
+
+        # 后台任务还在跑时，Stop 只是「本轮思考结束」，不是「等人决策」。
+        # Claude 的 Stop payload 带 background_tasks（Monitor / 后台 shell 等），
+        # 实测它非空的轮次全是空转：worker 等备份/CI，orchestrator 每轮回一句
+        # 「继续等」，5 轮烧掉高耗模型的调用。这是确定性信号，不需要模型判断。
+        bg = payload.get("background_tasks") or []
+        if bg and cfg.get("skip_background_tasks", True):
+            ensure_dirs()
+            worker = pane_label(pane)
+            # 同一 worker 只保留最新一条：等待期间每次 Stop 都会进来，
+            # 全留着会在兜底时一次性补派一串，又把 orchestrator 打爆。
+            for old in os.listdir(PENDING):
+                if old.endswith(f"-{pane.lstrip('%')}.json"):
+                    try:
+                        os.unlink(os.path.join(PENDING, old))
+                    except FileNotFoundError:
+                        pass
+            ms = int(time.time() * 1000)
+            save_json(os.path.join(PENDING, f"{ms:013d}-{pane.lstrip('%')}.json"),
+                      {"worker": worker, "pane": pane, "src": src,
+                       "text": text, "ts": ms / 1000})
+            dropped("background-tasks", worker)
+            return 0
+
+        ensure_dirs()
+        ms = int(time.time() * 1000)
+        ev = {"worker": pane_label(pane), "pane": pane, "src": src,
+              "session": session, "cwd": payload.get("cwd", ""), "text": text, "ts": ms / 1000}
+        save_json(os.path.join(INBOX, f"{ms:013d}-{pane.lstrip('%')}.json"), ev)
+        return 0
+    except Exception:
+        log("cmd_event 异常:\n" + traceback.format_exc())
+        return 0
+
+
+# ---------------------------------------------------------------- orchestrator / 人 写指令
+
+
+def enqueue(action, argv):
+    if len(argv) < 2:
+        print(f"用法: relay {action} <worker> <text>", file=sys.stderr)
+        return 2
+    worker, text = argv[0], " ".join(argv[1:])
+    ensure_dirs()
+    ms = int(time.time() * 1000)
+    save_json(os.path.join(OUTBOX, f"{ms:013d}-{action}.json"),
+              {"action": action, "worker": worker, "text": text, "ts": ms / 1000})
+    print(f"已入队 {action} {worker}（daemon 1s 内处理）")
+    return 0
+
+
+def worker_pane(state, worker):
+    return (state["workers"].get(worker) or {}).get("pane") or ""
+
+
+def cmd_context(argv):
+    """给 orchestrator 拉 worker 的完整原文。
+
+    派发消息里的末尾 N 字经常正好截掉结论；让 orchestrator 能自己要多一点，
+    而不是拿半截信息去猜。只读，不改变任何状态。
+    """
+    if not argv:
+        print("用法: relay context <worker> [行数，默认 100]", file=sys.stderr)
+        return 2
+    worker = argv[0]
+    try:
+        lines = int(argv[1]) if len(argv) > 1 else 100
+    except ValueError:
+        print("行数必须是整数", file=sys.stderr)
+        return 2
+    lines = max(10, min(lines, 500))
+
+    state = load_state()
+    st = state["workers"].get(worker) or {}
+    pane = st.get("pane") or ""
+    if not pane:
+        print(f"state 中找不到 worker: {worker}", file=sys.stderr)
+        return 1
+
+    r = tmux("capture-pane", "-p", "-J", "-t", pane, "-S", f"-{lines}")
+    if r.returncode != 0:
+        print(f"读取 pane 失败: {r.stderr.strip()}", file=sys.stderr)
+        return 1
+    out = "\n".join(l for l in r.stdout.splitlines() if l.strip())
+    print(f"=== {worker} ({pane}) 末尾 {lines} 行 ===")
+    print(out or "(空)")
+    if st.get("last_text"):
+        print(f"\n=== 该 worker 最近一次 Stop 的完整输出 ({len(st['last_text'])} 字) ===")
+        print(st["last_text"])
+    return 0
+
+
+def cmd_answer(argv):
+    """人的回复也走 outbox，保证 daemon 是 state 的唯一写者。"""
+    if not argv:
+        print("用法: relay answer <worker> [text]", file=sys.stderr)
+        return 2
+    worker, text = argv[0], " ".join(argv[1:])
+    pane = worker_pane(load_state(), worker)
+    if not pane:
+        print(f"state 中找不到 worker: {worker}（该 worker 需至少触发过一次事件）",
+              file=sys.stderr)
+        return 1
+    ensure_dirs()
+    ms = int(time.time() * 1000)
+    save_json(os.path.join(OUTBOX, f"{ms:013d}-answer.json"),
+              {"action": "answer", "worker": worker, "text": text, "ts": ms / 1000})
+    print(f"已入队 answer {worker}（daemon 1s 内处理）")
+    return 0
+
+
+# ---------------------------------------------------------------- daemon
+
+
+def new_token():
+    """工单号：短、可读、含 base64 字符集之外的判定不需要——只要足够随机。
+
+    不用 uuid，避免在邮件正文里显得像垃圾信息。
+    """
+    import secrets
+    return "T" + secrets.token_hex(5).upper()
+
+
+def do_escalate(state, cfg, worker, pane, reason, text):
+    st = state["workers"].setdefault(worker, {})
+    token = new_token()
+    st.update({"pane": pane, "status": "waiting_human", "escalated_at": time.time(),
+               "reply_token": token})
+    state["in_flight"] = None
+    save_state(state)
+    ok = notify(f"[relay] {token} {worker} 需要你介入",
+                escalate_body(cfg, worker, pane, reason, text, token))
+    log(f"已升级 {worker}: {reason} 工单={token}（通知{'成功' if ok else '未送达'}）")
+
+
+def check_pending(state, cfg):
+    """兜底：被 background_tasks 过滤掉的事件，超过 slack 秒后补派一次。
+
+    没有这道兜底就有死锁风险——Monitor 超时退出、worker 却没恢复的话，
+    它的事件会永远躺在 pending 里，谁都不会再问它。
+    """
+    slack = int(cfg.get("pending_slack", 600))
+    try:
+        names = sorted(n for n in os.listdir(PENDING) if n.endswith(".json"))
+    except FileNotFoundError:
+        return
+    now = time.time()
+    for name in names:
+        path = os.path.join(PENDING, name)
+        try:
+            with open(path, encoding="utf-8") as f:
+                ev = json.load(f)
+        except Exception:
+            os.unlink(path)
+            continue
+        if now - float(ev.get("ts", 0)) < slack:
+            continue
+        worker = ev.get("worker", "unknown")
+        # 已不在白名单 / 已被移除的 worker，其兜底事件直接丢弃
+        if ev.get("pane") not in [p for p in (cfg.get("worker_panes") or []) if p]:
+            os.unlink(path)
+            dropped("pending-unregistered", worker)
+            continue
+        st = state["workers"].get(worker, {})
+        if st.get("status") in ("waiting_human", "done"):
+            os.unlink(path)
+            continue
+        if state.get("in_flight"):
+            continue  # orchestrator 正忙，下轮再说
+        # 放回 inbox 走正常派发，由 dispatch 的轮次上限管着
+        os.replace(path, os.path.join(INBOX, name))
+        st["last_dispatch"] = 0  # 兜底事件不受节流阻挡
+        state["workers"][worker] = st
+        save_state(state)
+        log(f"{worker} 的后台任务已 {slack}s 未结束，事件转入正式派发（兜底）")
+
+
+def dispatch(state, cfg):
+    """一次只放一条事件给 orchestrator。"""
+    if state.get("in_flight"):
+        return
+    try:
+        names = sorted(n for n in os.listdir(INBOX) if n.endswith(".json"))
+    except FileNotFoundError:
+        return
+    if not names:
+        return
+    path = os.path.join(INBOX, names[0])
+    try:
+        with open(path, encoding="utf-8") as f:
+            ev = json.load(f)
+    except Exception as exc:
+        log(f"inbox 事件损坏，丢弃 {path}: {exc}")
+        os.unlink(path)
+        return
+
+    worker, pane = ev.get("worker", "unknown"), ev.get("pane", "")
+    st = state["workers"].get(worker, {})
+
+    if st.get("status") == "waiting_human":
+        os.unlink(path)
+        dropped("waiting_human", worker)
+        return
+
+    # done 现在只代表「上一个任务结束」，随后 done 分支已把状态重置为 idle，
+    # 所以这里不再拦截——worker 开启新任务时事件应当正常派发。
+    rounds, maxr = int(st.get("rounds", 0)), int(cfg.get("max_rounds", 64))
+    if rounds >= maxr:
+        os.unlink(path)
+        do_escalate(state, cfg, worker, pane, f"达到轮次上限 {maxr}", ev.get("text", ""))
+        return
+
+    # 节流：worker 等异步事件（Monitor / 备份 / CI）时每轮思考完都会 Stop，
+    # 若每次都派发就会空转——实测 33s、35s、57s 连发 5 轮，全是「继续等」。
+    # 真实决策间隔通常是分钟级，所以 120s 内的重复 Stop 直接丢弃。
+    gap = int(cfg.get("min_dispatch_interval", 0))
+    last = float(st.get("last_dispatch", 0) or 0)
+    if gap and time.time() - last < gap:
+        os.unlink(path)
+        dropped("throttled", worker)
+        log(f"{worker} 距上次派发不足 {gap}s，事件丢弃（避免空转）")
+        return
+
+    orch = cfg.get("orchestrator_pane") or ""
+    if not orch:
+        os.unlink(path)
+        log("orchestrator_pane 未配置，事件无法派发")
+        return
+
+    tail = (ev.get("text") or "")[-int(cfg.get("worker_tail_chars", 2000)):]
+    budget = (f"还有 {maxr - rounds - 1} 轮余量，不必这一轮就拍板。"
+              if maxr - rounds > 1 else
+              "这是最后一轮，下一条必须给出可执行结论或明确升级。")
+    msg = (f"[RELAY {rounds + 1}/{maxr}] worker={worker} pane={pane} "
+           f"cwd={ev.get('cwd')} src={ev.get('src')}\n"
+           f"--- worker 最后输出（末尾 {len(tail)} 字，可能被截断）---\n{tail}\n---\n"
+           f"{budget}\n"
+           f"先独立判断，不要跳过推理：\n"
+           f"  · 它到底卡在什么上？是缺决策，还是在等异步事件（备份/CI/Monitor）？\n"
+           f"  · 你的决定会影响什么？哪个选项可回滚？\n"
+           f"  · 现有信息够不够下结论？不够就先说明缺什么。\n"
+           f"需要更多原文时，用 `relay context {worker} [行数]` 拉取，别靠猜。\n"
+           f"想清楚之后，发下面**其中一条**命令（格式要精确）：\n"
+           f"  relay decide {worker} \"<决策>\"\n"
+           f"  relay done {worker} \"<完成摘要>\"\n"
+           f"  relay escalate {worker} \"<背景 / 已尝试方案 / A|B|C 选项与推荐>\"\n"
+           f"能凭任务目标和 DECISIONS.md 判断的用 decide/done；涉及花钱、删除、不可逆、"
+           f"需求歧义、或信息不足的 escalate。决策后把结论追加到 DECISIONS.md。")
+    if not paste(orch, msg):
+        log(f"派发失败，事件保留在 {path}")
+        return
+
+    os.unlink(path)
+    st.update({"pane": pane, "status": "waiting_orch", "last_text": ev.get("text", ""),
+               "last_dispatch": time.time()})
+    state["workers"][worker] = st
+    state["in_flight"] = {"worker": worker, "pane": pane,
+                          "since": time.time(), "rounds": rounds}
+    save_state(state)
+    log(f"派发 {worker} -> orchestrator（轮次 {rounds + 1}/{maxr}）")
+
+
+def apply_outbox(state, cfg):
+    try:
+        names = sorted(n for n in os.listdir(OUTBOX) if n.endswith(".json"))
+    except FileNotFoundError:
+        return
+    for name in names:
+        path = os.path.join(OUTBOX, name)
+        try:
+            with open(path, encoding="utf-8") as f:
+                cmd = json.load(f)
+        except Exception as exc:
+            log(f"outbox 损坏，丢弃 {path}: {exc}")
+            os.unlink(path)
+            continue
+
+        action, worker, text = cmd.get("action"), cmd.get("worker", ""), cmd.get("text", "")
+        # pane 只从 state 里取。不能用 in_flight 兜底：orchestrator 打错 worker 名时
+        # 会把决策投进另一个 worker 的 pane（误路由比失败更糟）。
+        pane = worker_pane(state, worker)
+        st = state["workers"].get(worker)
+
+        if st is None and action in ("decide", "answer"):
+            os.unlink(path)
+            log(f"{action} 失败：未知 worker {worker!r}，已丢弃（避免误路由）")
+            continue
+        if not pane and action in ("decide", "answer"):
+            os.unlink(path)
+            log(f"{action} 失败：worker {worker} 的 pane 未知（pane 可能已关闭）")
+            continue
+
+        st = state["workers"].setdefault(worker, {})
+        tries = int(cmd.get("tries", 0))
+
+        if action == "decide":
+            pat = cfg.get("dangerous_regex") or ""
+            if pat and re.search(pat, text, re.I):
+                os.unlink(path)
+                do_escalate(state, cfg, worker, pane,
+                            "决策命中 dangerous_regex（不可逆操作），拦截转人工", text)
+                continue
+            caution = caution_note(cfg, text)
+            if not paste(pane, f"[决策] {text}\n{caution}\n"
+                               f"（这是 orchestrator 的决策，请据此继续。）"):
+                retry_or_drop(path, cmd, tries, cfg, state, worker, pane,
+                              "decide 回灌失败")
+                continue
+            st.update({"pane": pane, "status": "running",
+                       "rounds": int(st.get("rounds", 0)) + 1})
+            state["in_flight"] = None
+            save_state(state)
+            os.unlink(path)
+            log(f"已回灌 {worker} 决策（rounds={st['rounds']}）")
+
+        elif action == "done":
+            # 一个任务结束 = 轮次清零、回到 idle，否则该 worker 再开新任务
+            # 会被 dispatch 里的 done 检查永久丢弃，只能人工 relay answer 复活。
+            st.update({"pane": pane or st.get("pane", ""), "status": "idle",
+                       "rounds": 0, "escalated_at": None})
+            state["in_flight"] = None
+            save_state(state)
+            os.unlink(path)
+            log(f"{worker} 已完成，轮次清零回到 idle: {text}")
+            if cfg.get("notify_done"):
+                notify(f"[relay] {worker} 已完成", text or "(无摘要)")
+
+        elif action == "escalate":
+            os.unlink(path)
+            do_escalate(state, cfg, worker, pane, "orchestrator 请求人工决策", text)
+
+        elif action == "answer":
+            if text and not paste(pane, f"[人工决策] {text}\n\n（这是人给出的决策，请据此继续。）"):
+                retry_or_drop(path, cmd, tries, cfg, state, worker, pane,
+                              "人工决策回灌失败")
+                continue
+            st.update({"pane": pane, "status": "running" if text else "idle",
+                       "rounds": 0, "escalated_at": None})
+            state["in_flight"] = None
+            save_state(state)
+            os.unlink(path)
+            log(f"{worker}: 已{'回灌人决策' if text else '解除静默'}")
+
+        else:
+            log(f"未知 action={action}，丢弃 {path}")
+            os.unlink(path)
+
+
+def caution_note(cfg, text):
+    """可回滚但需留意的动作只做标注，不拦截。
+
+    拦截交给 dangerous_regex，只针对不可逆操作。部署/上线这类用正则猜
+    「是命令还是否定句」做不到——worker 决策里的『禁止部署、生产写入』
+    曾被当成危险指令拦截，导致决策静默丢失。
+    """
+    pat = cfg.get("caution_regex") or ""
+    if pat and re.search(pat, text, re.I):
+        return "\n[提示] 决策文本含部署/生产相关字样，已照常下达、未拦截。请自行确认不越权。"
+    return ""
+
+
+def retry_or_drop(path, cmd, tries, cfg, state, worker, pane, what):
+    """回灌失败重试若干次后转人工，避免每秒无限重试刷日志。"""
+    tries += 1
+    limit = int(cfg.get("max_paste_retries", 20))
+    if tries >= limit:
+        os.unlink(path)
+        do_escalate(state, cfg, worker, pane, f"{what}（重试 {tries} 次仍失败）",
+                    cmd.get("text", ""))
+        return
+    cmd["tries"] = tries
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cmd, f, ensure_ascii=False)
+    os.replace(tmp, path)
+    log(f"{what}，第 {tries}/{limit} 次，稍后重试: {os.path.basename(path)}")
+
+
+def check_timeout(state, cfg):
+    inflight = state.get("in_flight")
+    if not inflight:
+        return
+    limit = int(cfg.get("timeout", 900))
+    if time.time() - float(inflight.get("since", 0)) < limit:
+        return
+    worker = inflight.get("worker", "unknown")
+    last = (state["workers"].get(worker) or {}).get("last_text", "")
+    do_escalate(state, cfg, worker, inflight.get("pane", ""),
+                f"orchestrator {limit}s 内未回复", last)
+
+
+def cmd_daemon():
+    ensure_dirs()
+    if not load_config().get("orchestrator_pane"):
+        log("警告: orchestrator_pane 未配置，daemon 只处理 outbox 与超时")
+
+    def stop(_sig, _frm):
+        log("daemon 收到退出信号")
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    log("daemon 启动")
+    last_mail = 0.0
+    while True:
+        try:
+            cfg = load_config()
+            state = load_state()
+            apply_outbox(state, cfg)
+            check_timeout(state, cfg)
+            check_pending(state, cfg)
+            dispatch(state, cfg)
+            now = time.time()
+            # 邮件回灌默认关闭：QQ 对自发邮件不做 SPF/DKIM 校验，From 白名单
+            # 挡不住外部服务器伪造发件人。确认风险后再开 mail_reply_enabled。
+            if cfg.get("mail_reply_enabled") and \
+                    now - last_mail >= int(cfg.get("imap_poll_interval", 30)):
+                last_mail = now
+                poll_mail(state, cfg)
+        except Exception:
+            log("daemon tick 异常:\n" + traceback.format_exc())
+        time.sleep(1)
+
+
+# ---------------------------------------------------------------- 运维
+
+
+def cmd_init():
+    ensure_dirs()
+    if os.path.exists(CONFIG_PATH):
+        print(f"配置已存在，未覆盖: {CONFIG_PATH}")
+    else:
+        cfg = dict(DEFAULTS)
+        pane = os.environ.get("TMUX_PANE", "")
+        if pane:
+            cfg["orchestrator_pane"] = pane
+        save_json(CONFIG_PATH, cfg)
+        print(f"已写入 {CONFIG_PATH}")
+    cfg = load_config()
+    print(f"orchestrator_pane = {cfg.get('orchestrator_pane') or '(未设置)'}")
+    print(f"channels          = {cfg.get('channels') or []}")
+    print("\n下一步：在每个 worker pane 里执行  relay register")
+    return 0
+
+
+def count_json(d):
+    try:
+        return len([n for n in os.listdir(d) if n.endswith(".json")])
+    except FileNotFoundError:
+        return 0
+
+
+def count_lines(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return sum(1 for _ in f)
+    except FileNotFoundError:
+        return 0
+
+
+def cmd_register(argv):
+    """把 pane 加入 worker 白名单。在 worker pane 内执行即注册自身。"""
+    pane = argv[0] if argv else os.environ.get("TMUX_PANE", "")
+    if not pane:
+        print("不在 tmux 中，需显式给 pane id（%N）", file=sys.stderr)
+        return 2
+    cfg = load_config()
+    if pane == (cfg.get("orchestrator_pane") or ""):
+        print(f"拒绝：{pane} 是 orchestrator", file=sys.stderr)
+        return 1
+    panes = [p for p in (cfg.get("worker_panes") or []) if p]
+    if pane in panes:
+        print(f"已注册: {pane_label(pane)} ({pane})")
+        return 0
+    panes.append(pane)
+    cfg["worker_panes"] = panes
+    ensure_dirs()
+    save_json(CONFIG_PATH, cfg)
+    print(f"已注册 worker: {pane_label(pane)} ({pane})，共 {len(panes)} 个")
+    return 0
+
+
+def cmd_unregister(argv):
+    pane = argv[0] if argv else os.environ.get("TMUX_PANE", "")
+    cfg = load_config()
+    panes = [p for p in (cfg.get("worker_panes") or []) if p and p != pane]
+    cfg["worker_panes"] = panes
+    ensure_dirs()
+    save_json(CONFIG_PATH, cfg)
+    print(f"已移除 {pane}，剩余 {len(panes)} 个 worker")
+    return 0
+
+
+def cmd_status():
+    cfg, state = load_config(), load_state()
+    orch = cfg.get("orchestrator_pane") or ""
+    n_in, n_out, n_drop = count_json(INBOX), count_json(OUTBOX), count_lines(DROPPED)
+    inf = state.get("in_flight")
+    print(f"orchestrator : {orch} [{pane_label(orch)}]" if orch else "orchestrator : (未设置)")
+    print(f"channels     : {', '.join(cfg.get('channels') or []) or '(仅本地日志)'}")
+    print(f"worker_panes : {', '.join(cfg.get('worker_panes') or []) or '(无，事件全部拒绝)'}")
+    print(f"max_rounds   : {cfg.get('max_rounds')}   timeout: {cfg.get('timeout')}s")
+    print(f"in_flight    : " + (f"{inf['worker']} ({time.time() - inf['since']:.0f}s)" if inf else "-"))
+    print(f"inbox/outbox : {n_in} / {n_out}    dropped: {n_drop}")
+    if state["workers"]:
+        print("\nworker                      status          rounds  pane")
+        for name, st in sorted(state["workers"].items()):
+            print(f"{name:<27} {st.get('status', '-'):<15} {st.get('rounds', 0):<7} {st.get('pane', '-')}")
+    return 0
+
+
+USAGE = """relay — 多 agent tmux 编排中继
+
+  relay init                       写入 ~/.agent-relay/config.json（在 orchestrator pane 中执行）
+  relay register [pane]            把当前/指定 pane 注册为 worker（在 worker pane 中执行）
+  relay unregister [pane]          移除 worker 白名单项
+  relay event --src claude|codex   hook 入口（由 hook 调用）
+  relay decide <worker> <text>     orchestrator: 回灌决策
+  relay done <worker> <text>       orchestrator: 标记完成
+  relay escalate <worker> <text>   orchestrator: 升级给人
+  relay answer <worker> [text]     人: 回灌决策 / 无 text 仅解除静默
+  relay context <worker> [行数]    orchestrator: 拉取 worker 完整原文（只读）
+  relay daemon                     常驻调度
+  relay status                     查看状态
+"""
+
+
+def main():
+    argv = sys.argv[1:]
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(USAGE)
+        return 0
+    cmd, rest = argv[0], argv[1:]
+    if cmd == "event":
+        src = rest[rest.index("--src") + 1] if "--src" in rest[:-1] else "claude"
+        return cmd_event(src)
+    if cmd in ("decide", "done", "escalate"):
+        return enqueue(cmd, rest)
+    if cmd == "answer":
+        return cmd_answer(rest)
+    if cmd == "context":
+        return cmd_context(rest)
+    if cmd == "daemon":
+        return cmd_daemon()
+    if cmd == "init":
+        return cmd_init()
+    if cmd == "register":
+        return cmd_register(rest)
+    if cmd == "unregister":
+        return cmd_unregister(rest)
+    if cmd == "status":
+        return cmd_status()
+    print(f"未知命令: {cmd}\n\n{USAGE}", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
