@@ -42,6 +42,7 @@ DEFAULTS = {
     "min_dispatch_interval": 120,
     "skip_background_tasks": True,
     "pending_slack": 600,
+    "throttle_slack": 300,
     "timeout": 900,
     "notify_done": True,
     # 只拦不可逆、无法撤销的操作。部署/上线/删除这类可回滚动作交给 caution_regex
@@ -577,20 +578,9 @@ def cmd_event(src):
         bg = payload.get("background_tasks") or []
         if bg and cfg.get("skip_background_tasks", True):
             ensure_dirs()
-            worker = pane_label(pane)
-            # 同一 worker 只保留最新一条：等待期间每次 Stop 都会进来，
-            # 全留着会在兜底时一次性补派一串，又把 orchestrator 打爆。
-            for old in os.listdir(PENDING):
-                if old.endswith(f"-{pane.lstrip('%')}.json"):
-                    try:
-                        os.unlink(os.path.join(PENDING, old))
-                    except FileNotFoundError:
-                        pass
-            ms = int(time.time() * 1000)
-            save_json(os.path.join(PENDING, f"{ms:013d}-{pane.lstrip('%')}.json"),
-                      {"worker": worker, "pane": pane, "src": src,
-                       "text": text, "ts": ms / 1000})
-            dropped("background-tasks", worker)
+            keep_latest_pending(pane, pane_label(pane),
+                                {"pane": pane, "src": src, "text": text})
+            dropped("background-tasks", pane_label(pane))
             return 0
 
         ensure_dirs()
@@ -710,12 +700,19 @@ def do_escalate(state, cfg, worker, pane, reason, text):
 
 
 def check_pending(state, cfg):
-    """兜底：被 background_tasks 过滤掉的事件，超过 slack 秒后补派一次。
+    """兜底：被过滤掉的事件，超过各自的 slack 后补派一次。
+
+    两类事件用不同的延迟：
+      · background-tasks：worker 在等异步任务，等久一点无妨（pending_slack，默认 3600s）
+      · throttled：只是被时间节流挡住的正常请求（codex 专用），
+        用 throttle_slack（默认 300s）尽快补派，别让 worker 干等。
+        claude 不会走到这里——它的事件由 background_tasks 确定性判断。
 
     没有这道兜底就有死锁风险——Monitor 超时退出、worker 却没恢复的话，
     它的事件会永远躺在 pending 里，谁都不会再问它。
     """
-    slack = int(cfg.get("pending_slack", 600))
+    default_slack = int(cfg.get("pending_slack", 600))
+    throttle_slack = int(cfg.get("throttle_slack", 300))
     try:
         names = sorted(n for n in os.listdir(PENDING) if n.endswith(".json"))
     except FileNotFoundError:
@@ -729,6 +726,7 @@ def check_pending(state, cfg):
         except Exception:
             os.unlink(path)
             continue
+        slack = throttle_slack if ev.get("reason") == "throttled" else default_slack
         if now - float(ev.get("ts", 0)) < slack:
             continue
         worker = ev.get("worker", "unknown")
@@ -748,7 +746,27 @@ def check_pending(state, cfg):
         st["last_dispatch"] = 0  # 兜底事件不受节流阻挡
         state["workers"][worker] = st
         save_state(state)
-        log(f"{worker} 的后台任务已 {slack}s 未结束，事件转入正式派发（兜底）")
+        log(f"{worker} 的事件在 pending 等待 {slack}s 后转入正式派发（兜底）")
+
+
+def keep_latest_pending(pane, worker, ev, reason="background-tasks"):
+    """把事件放进 pending/，同一 worker 只保留最新一条。
+
+    等待期间每次 Stop 都会进来，全留着会在兜底时一次性补派一串，
+    又把 orchestrator 打爆；只留最新一条就够了——它包含最新的状态。
+    """
+    ensure_dirs()
+    tag = pane.lstrip("%")
+    for old in os.listdir(PENDING):
+        if old.endswith(f"-{tag}.json"):
+            try:
+                os.unlink(os.path.join(PENDING, old))
+            except FileNotFoundError:
+                pass
+    ms = int(time.time() * 1000)
+    save_json(os.path.join(PENDING, f"{ms:013d}-{tag}.json"),
+              {"worker": worker, "pane": pane, "src": ev.get("src", ""),
+               "text": ev.get("text", ""), "reason": reason, "ts": ms / 1000})
 
 
 def dispatch(state, cfg):
@@ -786,16 +804,26 @@ def dispatch(state, cfg):
         do_escalate(state, cfg, worker, pane, f"达到轮次上限 {maxr}", ev.get("text", ""))
         return
 
-    # 节流：worker 等异步事件（Monitor / 备份 / CI）时每轮思考完都会 Stop，
-    # 若每次都派发就会空转——实测 33s、35s、57s 连发 5 轮，全是「继续等」。
-    # 真实决策间隔通常是分钟级，所以 120s 内的重复 Stop 直接丢弃。
-    gap = int(cfg.get("min_dispatch_interval", 0))
-    last = float(st.get("last_dispatch", 0) or 0)
-    if gap and time.time() - last < gap:
-        os.unlink(path)
-        dropped("throttled", worker)
-        log(f"{worker} 距上次派发不足 {gap}s，事件丢弃（避免空转）")
-        return
+    # 节流只对「拿不到 background_tasks」的源生效。
+    #
+    # claude 的 Stop payload 带 background_tasks，非空即「本轮结束但任务还在跑」，
+    # 那是确定性信号，已经在 cmd_event 里过滤掉，不需要再按时间猜。
+    # 对它再做时间节流是有害的：实测 worker 真正做完、提 review 的那次 Stop，
+    # 因为距上次派发只有 117s 就被丢弃，orchestrator 永远不知道它在等 review。
+    #
+    # codex 没有 background_tasks（它的 Stop 语义干净，但也无法区分异步等待），
+    # 只能按时间兜底。且命中后进 pending/ 而不是丢弃——丢弃会永久丢失请求，
+    # 延迟只是晚一点问。
+    if ev.get("src") != "claude":
+        gap = int(cfg.get("min_dispatch_interval", 0))
+        last = float(st.get("last_dispatch", 0) or 0)
+        if gap and time.time() - last < gap:
+            keep_latest_pending(pane, worker, ev, reason="throttled")
+            os.unlink(path)
+            dropped("throttled", worker)
+            log(f"{worker}({ev.get('src')}) 距上次派发不足 {gap}s，"
+                f"转入 pending 等待补派")
+            return
 
     orch = cfg.get("orchestrator_pane") or ""
     if not orch:
