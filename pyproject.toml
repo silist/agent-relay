@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-relay"
+version = "0.1.0"
+description = "Route decisions between AI coding agents over tmux — worker asks, orchestrator decides, human only when needed."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.8"
+authors = [{ name = "silist" }]
+keywords = ["ai-agents", "tmux", "orchestration", "claude-code", "codex", "cli"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Environment :: Console",
+    "Topic :: Software Development :: Tools",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/silist/agent-relay"
+Repository = "https://github.com/silist/agent-relay"
+Changelog = "https://github.com/silist/agent-relay/blob/master/CHANGELOG.md"
+
+# bin/relay 是唯一权威源，带 shebang 的可执行脚本。
+# 用 script-files 直接按原样装进 bin/，避免为了打包把源码拆成模块再维护两份。
+[tool.setuptools]
+script-files = ["bin/relay"]
