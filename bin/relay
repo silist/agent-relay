@@ -30,6 +30,9 @@ OUTBOX = os.path.join(BASE, "outbox")
 DROPPED = os.path.join(BASE, "dropped.log")
 LOG = os.path.join(BASE, "relay.log")
 BUF = "relay"
+# 最近一次「orchestrator 解析不到」告警时的 target。daemon 每秒 tick 一次，
+# 没有这个去重会把日志刷满。
+_orch_warned = ""
 
 DEFAULTS = {
     "orchestrator_pane": "",
@@ -127,6 +130,64 @@ def dropped(reason, worker):
 
 def tmux(*args):
     return subprocess.run(["tmux", *args], capture_output=True, text=True)
+
+
+def pane_target(pane):
+    """把 pane id 解析成 tmux server 重启后依然有效的目标字符串。
+
+    `%N` 是 tmux 的运行时编号，server 一重启就全部分配。配置里存 `%3` 的话，
+    重启后那个编号要么不存在、要么落到别的 window 上——曾因此让 daemon
+    每秒对着一个不存在的 pane 重试 14 次。
+
+    存 `session:w.p` 就没这个问题：名字是稳定的，编号在重启后通常也相同，
+    万一不同，resolve_pane 会按 session+window 重新找到当前 pane。
+    """
+    if not pane:
+        return ""
+    r = tmux("display-message", "-p", "-t", pane,
+             "#{session_name}:#{window_index}.#{pane_index}")
+    if r.returncode != 0:
+        return ""
+    target = r.stdout.strip()
+    # pane 已消失时 tmux 仍返回 0，格式化成 ":. " 这种空字段拼出来的东西。
+    # 必须逐段校验非空，只查分隔符会放过它。
+    sess, _, rest = target.partition(":")
+    win, _, pidx = rest.partition(".")
+    if not (sess and win.isdigit() and pidx.isdigit()):
+        return ""
+    return target
+
+
+def resolve_pane(pane):
+    """把配置里的 pane 目标解析成当前存活的 pane id，解析不到返回空串。
+
+    tmux 对不存在的 target 也返回 0（只是输出空），所以不能靠返回值判断；
+    而且越界索引会被**静默钳制**（`sess:1.9` 会落到该窗口的最后一个 pane），
+    所以还要回查 id 确实存在，并和输入不是「被改写过的」目标。
+
+    正因为有钳制，这个函数只保证「这个 target 现在指向某个活着的 pane」，
+    不保证它指向的是你原本想要的那个 pane。用作白名单判定时足够
+    （钳制后的 pane 也是同一会话里的 pane），用作身份识别时不够。
+    """
+    if not pane:
+        return ""
+    r = tmux("display-message", "-p", "-t", pane, "#{pane_id}")
+    if r.returncode != 0:
+        return ""
+    pid = r.stdout.strip()
+    # 只认 pane id 格式，避免 `display-message -t` 解析失败时输出别的东西
+    if not (pid.startswith("%") and pid[1:].isdigit()):
+        return ""
+    # 二次确认：上面拿到的是 id，但 target 指向的 session 可能已经不存在
+    r = tmux("list-panes", "-t", pid, "-F", "#{pane_id}")
+    if r.returncode != 0 or r.stdout.strip() != pid:
+        return ""
+    return pid
+
+
+def worker_pane(state, worker):
+    """worker 的 pane，经 resolve 后返回当前 id；worker 已退出返回空串。"""
+    return resolve_pane((state["workers"].get(worker) or {}).get("pane") or "")
 
 
 def pane_label(pane):
@@ -488,11 +549,20 @@ def looks_like_request(text):
 
     这里用保守的措辞匹配：宁可多派发一次，也不要漏掉请求。
     漏派的代价是 worker 静默卡死；多派的代价只是一次 orchestration 调用。
+
+    这条取舍被现实反复验证。真实事故（2026-11-07）：mp-sql 交了 17 个任务的
+    只读核对表，结尾写「次选 a2113302。等你的授权 job_id 才执行 resume。」，
+    同时挂着 2 个后台 shell。旧规则一条都没命中——「等你的授权」不在任何
+    动词表里——于是整条进 pending 排队一小时。orchestrator 完全不知道它在等授权。
+
+    下面是补过的句式：核心是「等人要东西」和「向人提问」两类，不限于
+    review/confirm。仍然只是枚举，必然有漏网——所以 pending 兜底不能去掉。
     """
     if not text:
         return False
     t = text.lower()
     pats = (
+        # —— 旧规则：等审查/确认类 ——
         r"等待.{0,12}(审查|审阅|review|复核|确认|决定|决策|授权|回复|指示)",
         r"(等|请|需要).{0,10}(主 ?agent|orchestrator|你).{0,10}(审查|审阅|review|确认|决定)",
         r"(请|需要|请求).{0,6}(审查|审阅|review|确认|批准|授权)",
@@ -501,6 +571,18 @@ def looks_like_request(text):
         r"(pending|waiting for).{0,20}(review|approval|confirmation)",
         r"(等|待).{0,8}(本次|此次)?\s*(review|审查|审阅|复核|验收|确认)",
         r"(ask|need).{0,15}(approval|decision|review)",
+        # —— 补充：等人给东西（授权/指示/下一步/答复）——
+        # 「等你的授权」「待您确认」「等你下一步」——名词不必是 review 那一套
+        r"(等|待).{0,4}(你|您).{0,4}的?.{0,4}"
+        r"(授权|指示|指令|确认|决定|拍板|定夺|回复|答复|下一步|消息)",
+        # —— 补充：先授权才动手 ——
+        r"(授权|批准|同意).{0,8}(才|之?后|再).{0,8}(执行|继续|恢复|推进|resume)",
+        # —— 补充：向人提问「要不要/是否/能否」——
+        r"(要不要|是否|能否|可否).{0,16}(继续|恢复|执行|推进|开始)",
+        # —— 补充：明确请人决定/告知 ——
+        r"(请|需要|想请|告知|告诉|通知|报告).{0,4}你.{0,10}"
+        r"(决定|定夺|拍板|确认|授权|圈定|批准|继续)",
+        r"(交给你|由你).{0,10}(圈定|决定|定夺|拍板|确认)",
     )
     return any(re.search(p, t) for p in pats)
 
@@ -573,15 +655,16 @@ def cmd_event(src):
         if not pane:
             dropped("not-in-tmux", "")
             return 0
-        orch = cfg.get("orchestrator_pane") or ""
+        orch = resolve_pane(cfg.get("orchestrator_pane") or "")
         if orch and pane == orch:
             dropped("is-orchestrator", pane_label(pane))
             return 0
-        # worker_panes 是白名单。本机常年同时跑多个互不相关的 agent 会话
-        # （media-pipeline、remotion 等），若接受任意 pane 的 Stop，它们每次
-        # 停下都会去打扰 orchestrator。空列表 = 没有 worker，全部拒绝。
+        # worker_panes 是白名单：必须是「这个 pane 的稳定目标」，而不是光秃秃的
+        # pane id。存 `%1` 的话 tmux 重启后编号重排，白名单会把别的不相关
+        # agent 放进来。这里把配置项逐个 resolve 再比对当前 id，两边都稳定。
         allow = [p for p in (cfg.get("worker_panes") or []) if p]
-        if pane not in allow:
+        # 先比对原值：存量配置里可能还是 `%1` 这种 id，命中就不必再逐条 resolve
+        if pane not in allow and not any(resolve_pane(p) == pane for p in allow):
             dropped("not-in-worker-panes", pane_label(pane))
             return 0
 
@@ -641,10 +724,6 @@ def enqueue(action, argv):
               {"action": action, "worker": worker, "text": text, "ts": ms / 1000})
     print(f"已入队 {action} {worker}（daemon 1s 内处理）")
     return 0
-
-
-def worker_pane(state, worker):
-    return (state["workers"].get(worker) or {}).get("pane") or ""
 
 
 def cmd_context(argv):
@@ -768,8 +847,12 @@ def check_pending(state, cfg):
         if now - since < slack:
             continue
         worker = ev.get("worker", "unknown")
-        # 已不在白名单 / 已被移除的 worker，其兜底事件直接丢弃
-        if ev.get("pane") not in [p for p in (cfg.get("worker_panes") or []) if p]:
+        # 已不在白名单 / 已被移除的 worker，其兜底事件直接丢弃。
+        # 比对前先 resolve：白名单里存的是稳定目标，事件里存的是当时的 pane id。
+        alive = resolve_pane(ev.get("pane", ""))
+        allow = [p for p in (cfg.get("worker_panes") or []) if p]
+        if not alive or not (
+                ev.get("pane") in allow or any(resolve_pane(p) == alive for p in allow)):
             os.unlink(path)
             dropped("pending-unregistered", worker)
             continue
@@ -797,7 +880,10 @@ def keep_latest_pending(pane, worker, ev, reason="background-tasks"):
     计时一旦被覆盖重置，频繁 Stop 的 worker 就永远等不到补派。
     """
     ensure_dirs()
-    tag = pane.lstrip("%")
+    # 文件名用稳定目标（session:w.p），不用 pane 编号：编号在 tmux 重启后会重排，
+    # 拿编号做键的话，旧 pending 永远匹配不上新事件，「只留最新一条」就失效了。
+    # 解析不到（pane 已退出）就退回 id——那条事件反正也会在 dispatch 里被丢弃。
+    tag = (pane_target(pane) or pane).replace(":", "_").replace(".", "_")
     first_ts = time.time()
     for old in os.listdir(PENDING):
         if old.endswith(f"-{tag}.json"):
@@ -837,6 +923,14 @@ def dispatch(state, cfg):
         return
 
     worker, pane = ev.get("worker", "unknown"), ev.get("pane", "")
+    # worker 可能已经退出（pane 关闭、会话结束）。此时派发必定失败，而下面
+    # 的 paste 失败路径只是「事件留着下次再试」，会变成每秒一次的死循环。
+    # 直接丢弃并记账：worker 都退出了，这条请求已经没有接收方。
+    if not resolve_pane(pane):
+        os.unlink(path)
+        dropped("worker-pane-gone", worker)
+        log(f"丢弃 {worker} 的事件：pane {pane} 已不存在")
+        return
     st = state["workers"].get(worker, {})
 
     if st.get("status") == "waiting_human":
@@ -873,10 +967,18 @@ def dispatch(state, cfg):
                 f"转入 pending 等待补派")
             return
 
-    orch = cfg.get("orchestrator_pane") or ""
+    orch = resolve_pane(cfg.get("orchestrator_pane") or "")
     if not orch:
-        os.unlink(path)
-        log("orchestrator_pane 未配置，事件无法派发")
+        # 事件留在 inbox，等 orchestrator 重新登记后下一轮 tick 自然派发。
+        # 这里每秒都会走到，所以只在首次（或 target 变化时）记一次日志——
+        # 刷屏会盖掉真正有用的信息。
+        global _orch_warned
+        target = cfg.get("orchestrator_pane") or ""
+        if target != _orch_warned:
+            _orch_warned = target
+            log(f"orchestrator_pane {target!r} 解析不到存活 pane"
+                f"（未配置，或已随 tmux 重启失效）；事件保留在 {path}。"
+                f"在 orchestrator 的 pane 里执行 `relay orch` 重新登记")
         return
 
     tail = (ev.get("text") or "")[-int(cfg.get("worker_tail_chars", 2000)):]
@@ -907,6 +1009,8 @@ def dispatch(state, cfg):
            f"  relay decide {worker} \"<决策>\"\n"
            f"  relay done {worker} \"<完成摘要>\"\n"
            f"  relay escalate {worker} \"<背景 / 已尝试方案 / A|B|C 选项与推荐>\"\n"
+           f"decide 和 done 都会把这段文本发给 worker；两者都只改本地状态、不给 worker\n"
+           f"发文本的用法是 relay done {worker} \"\"。\n"
            f"决策后把结论追加到 DECISIONS.md。")
     if not paste(orch, msg):
         log(f"派发失败，事件保留在 {path}")
@@ -951,6 +1055,19 @@ def apply_outbox(state, cfg):
             os.unlink(path)
             log(f"{action} 失败：worker {worker} 的 pane 未知（pane 可能已关闭）")
             continue
+        if action == "done" and text and not pane:
+            # done 仍要归零轮次（那个 worker 确实没在等回复了），
+            # 但它带的指令无处投递——必须大声说出来，不能当它没发生。
+            os.unlink(path)
+            dropped("done-pane-gone", worker)
+            log(f"done 未投递：worker {worker} 的 pane 已退出，文本 {len(text)} 字已丢弃")
+            notify(f"[relay] {worker} 的 done 未投递",
+                   f"worker 的 pane 已退出，以下收尾说明没有送达：\n\n{text}")
+            st = state["workers"].setdefault(worker, {})
+            st.update({"status": "idle", "rounds": 0, "escalated_at": None})
+            state["in_flight"] = None
+            save_state(state)
+            continue
 
         st = state["workers"].setdefault(worker, {})
         tries = int(cmd.get("tries", 0))
@@ -976,14 +1093,31 @@ def apply_outbox(state, cfg):
             log(f"已回灌 {worker} 决策（rounds={st['rounds']}）")
 
         elif action == "done":
-            # 一个任务结束 = 轮次清零、回到 idle，否则该 worker 再开新任务
-            # 会被 dispatch 里的 done 检查永久丢弃，只能人工 relay answer 复活。
+            # done 有两种用法，靠 text 是否为空区分：
+            #   带 text  = 「这轮结束了，但这是我要交代的话」→ 必须投递
+            #   不带 text = 纯记账，只改状态，不碰 worker
+            #
+            # 曾经 done 无论带不带 text 都只改本地状态。结果 orchestrator 写
+            # 「撤销上一条 done 的收尾含义，继续工作……」这种明确指令，worker
+            # 一个字都收不到，两边对「有没有交代过」的认知直接分叉。而 dispatch
+            # 的 prompt 又把 decide/done/escalate 并列成「发其中一条」，没人会
+            # 想到 done 的消息会落进黑洞。
+            #
+            # 和 decide 一样走重试：投递失败不能静默吞掉指令。
+            if text and pane:
+                if not paste(pane, f"[已完成] {text}\n"
+                                   f"（orchestrator 认为本轮结束；如仍有指示，以上为准）"):
+                    retry_or_drop(path, cmd, tries, cfg, state, worker, pane,
+                                  "done 回灌失败")
+                    continue
             st.update({"pane": pane or st.get("pane", ""), "status": "idle",
                        "rounds": 0, "escalated_at": None})
             state["in_flight"] = None
             save_state(state)
             os.unlink(path)
-            log(f"{worker} 已完成，轮次清零回到 idle: {text}")
+            log(f"{worker} 已完成，轮次清零回到 idle"
+                + ("（已投递收尾说明）" if text and pane else "")
+                + f": {text}")
             if cfg.get("notify_done"):
                 notify(f"[relay] {worker} 已完成", text or "(无摘要)")
         elif action == "escalate":
@@ -1092,13 +1226,16 @@ def cmd_init():
         print(f"配置已存在，未覆盖: {CONFIG_PATH}")
     else:
         cfg = dict(DEFAULTS)
-        pane = os.environ.get("TMUX_PANE", "")
+        # 存稳定目标而不是 pane id：id 在 tmux 重启后会重排
+        pane = pane_target(os.environ.get("TMUX_PANE", ""))
         if pane:
             cfg["orchestrator_pane"] = pane
         save_json(CONFIG_PATH, cfg)
         print(f"已写入 {CONFIG_PATH}")
     cfg = load_config()
-    print(f"orchestrator_pane = {cfg.get('orchestrator_pane') or '(未设置)'}")
+    orch = cfg.get("orchestrator_pane") or ""
+    print(f"orchestrator_pane = {orch or '(未设置)'}"
+          + ("" if not orch or resolve_pane(orch) else "  ⚠ 解析不到存活 pane"))
     print(f"channels          = {cfg.get('channels') or []}")
     print("\n下一步：在每个 worker pane 里执行  relay register")
     return 0
@@ -1120,59 +1257,121 @@ def count_lines(path):
 
 
 def cmd_register(argv):
-    """把 pane 加入 worker 白名单。在 worker pane 内执行即注册自身。"""
+    """把 pane 加入 worker 白名单。在 worker pane 内执行即注册自身。
+
+    存的是稳定目标（session:w.p）而不是 `%N`，tmux 重启后仍能解析回同一个窗口。
+    """
     pane = argv[0] if argv else os.environ.get("TMUX_PANE", "")
     if not pane:
-        print("不在 tmux 中，需显式给 pane id（%N）", file=sys.stderr)
+        print("不在 tmux 中，需显式给 pane 目标（%N 或 session:w.p）", file=sys.stderr)
         return 2
+    if not resolve_pane(pane):
+        print(f"pane 不存在: {pane}", file=sys.stderr)
+        return 1
+    store = pane_target(pane)
     cfg = load_config()
-    if pane == (cfg.get("orchestrator_pane") or ""):
-        print(f"拒绝：{pane} 是 orchestrator", file=sys.stderr)
+    if resolve_pane(cfg.get("orchestrator_pane") or "") == resolve_pane(pane):
+        print(f"拒绝：{pane_label(pane)} 是 orchestrator", file=sys.stderr)
         return 1
     panes = [p for p in (cfg.get("worker_panes") or []) if p]
-    if pane in panes:
-        print(f"已注册: {pane_label(pane)} ({pane})")
+    # 按解析后的 pane 判重：同一窗口可能既存着 %1 又存着 session:w.p。
+    # 存量配置里常常是 `%N`，就地把这一项改写成稳定目标——否则「已注册」
+    # 会变成一个永久跳过迁移的假阳性，tmux 一重启又失效。
+    pid = resolve_pane(pane)
+    if any(resolve_pane(p) == pid for p in panes):
+        old = next(p for p in panes if resolve_pane(p) == pid)
+        # 顺手丢掉指向同一个 pane 的重复条目
+        cfg["worker_panes"] = [store if p == old else p for p in panes
+                               if p == old or resolve_pane(p) != pid]
+        save_json(CONFIG_PATH, cfg)
+        if old != store:
+            print(f"已更新 {pane_label(pid)}: {old} -> {store}（原为运行时编号）")
+        else:
+            print(f"已注册: {pane_label(pid)} ({pid})")
         return 0
-    panes.append(pane)
+    panes.append(store)
     cfg["worker_panes"] = panes
     ensure_dirs()
     save_json(CONFIG_PATH, cfg)
-    print(f"已注册 worker: {pane_label(pane)} ({pane})，共 {len(panes)} 个")
+    print(f"已注册 worker: {pane_label(pane)} ({pid} = {store})，共 {len(panes)} 个")
+    return 0
+
+
+def cmd_orch(argv):
+    """登记 orchestrator：默认登记当前 pane，也可显式给目标。
+
+    和 register 对称——orchestrator 的坐标同样不该手改 config.json。
+    tmux 重启后 pane id 全部重排，在 orchestrator 里执行一次 `relay orch` 即可恢复。
+    """
+    pane = argv[0] if argv else os.environ.get("TMUX_PANE", "")
+    if not pane:
+        print("不在 tmux 中，需显式给 pane 目标（%N 或 session:w.p）", file=sys.stderr)
+        return 2
+    pid = resolve_pane(pane)
+    if not pid:
+        print(f"pane 不存在: {pane}", file=sys.stderr)
+        return 1
+    store = pane_target(pane)
+    cfg = load_config()
+    # 一个 pane 不能同时是 orchestrator 和 worker
+    cfg["worker_panes"] = [p for p in (cfg.get("worker_panes") or [])
+                           if p and resolve_pane(p) != pid]
+    cfg["orchestrator_pane"] = store
+    ensure_dirs()
+    save_json(CONFIG_PATH, cfg)
+    print(f"已登记 orchestrator: {pane_label(pid)} ({pid} = {store})")
+    print(f"worker_panes 现有 {len(cfg['worker_panes'])} 个")
     return 0
 
 
 def cmd_unregister(argv):
     pane = argv[0] if argv else os.environ.get("TMUX_PANE", "")
     cfg = load_config()
-    panes = [p for p in (cfg.get("worker_panes") or []) if p and p != pane]
+    pid = resolve_pane(pane)
+    # 一次移除所有指向同一个 pane 的条目（既可能存着 %1，也可能存着 session:w.p）
+    panes = [p for p in (cfg.get("worker_panes") or [])
+             if p and p != pane and (not pid or resolve_pane(p) != pid)]
     cfg["worker_panes"] = panes
     ensure_dirs()
     save_json(CONFIG_PATH, cfg)
-    print(f"已移除 {pane}，剩余 {len(panes)} 个 worker")
+    print(f"已移除 {pane or '(空)'}，剩余 {len(panes)} 个 worker")
     return 0
 
 
 def cmd_status():
     cfg, state = load_config(), load_state()
-    orch = cfg.get("orchestrator_pane") or ""
+    orch_cfg = cfg.get("orchestrator_pane") or ""
+    orch = resolve_pane(orch_cfg)
     n_in, n_out, n_drop = count_json(INBOX), count_json(OUTBOX), count_lines(DROPPED)
     inf = state.get("in_flight")
-    print(f"orchestrator : {orch} [{pane_label(orch)}]" if orch else "orchestrator : (未设置)")
+    if orch_cfg:
+        # 解析不到时把原始值也打出来：这是 tmux 重启后最常见的故障，
+        # 光看 `%3` 无法判断它是死是活。
+        state_note = "" if orch else f"  ⚠ 解析不到存活 pane（原始值 {orch_cfg}）→ 在 orchestrator 里跑 relay orch"
+        print(f"orchestrator : {orch or orch_cfg} [{pane_label(orch or orch_cfg)}]{state_note}")
+    else:
+        print("orchestrator : (未设置)")
     print(f"channels     : {', '.join(cfg.get('channels') or []) or '(仅本地日志)'}")
-    print(f"worker_panes : {', '.join(cfg.get('worker_panes') or []) or '(无，事件全部拒绝)'}")
+    print(f"worker_panes : "
+          + (", ".join(f"{p} [{pane_label(resolve_pane(p))}]" if resolve_pane(p)
+                       else f"{p} ⚠ 已失效" for p in (cfg.get("worker_panes") or []))
+             or "(无，事件全部拒绝)"))
     print(f"max_rounds   : {cfg.get('max_rounds')}   timeout: {cfg.get('timeout')}s")
     print(f"in_flight    : " + (f"{inf['worker']} ({time.time() - inf['since']:.0f}s)" if inf else "-"))
     print(f"inbox/outbox : {n_in} / {n_out}    dropped: {n_drop}")
     if state["workers"]:
         print("\nworker                      status          rounds  pane")
         for name, st in sorted(state["workers"].items()):
-            print(f"{name:<27} {st.get('status', '-'):<15} {st.get('rounds', 0):<7} {st.get('pane', '-')}")
+            print(f"{name:<27} {st.get('status', '-'):<15} {st.get('rounds', 0):<7} "
+                  f"{st.get('pane', '-')}"
+                  + ("" if resolve_pane(st.get('pane', '')) else " ⚠ 已退出"))
     return 0
 
 
 USAGE = """agent-relay — 多 agent tmux 编排中继
 
   relay init                       写入 ~/.agent-relay/config.json（在 orchestrator pane 中执行）
+  relay orch [pane]                在当前/指定 pane 登记 orchestrator（tmux 重启后跑一次）
   relay register [pane]            把当前/指定 pane 注册为 worker（在 worker pane 中执行）
   relay unregister [pane]          移除 worker 白名单项
   relay event --src claude|codex   hook 入口（由 hook 调用）
@@ -1205,6 +1404,8 @@ def main():
         return cmd_daemon()
     if cmd == "init":
         return cmd_init()
+    if cmd == "orch":
+        return cmd_orch(rest)
     if cmd == "register":
         return cmd_register(rest)
     if cmd == "unregister":

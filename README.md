@@ -92,8 +92,18 @@ uv tool install git+https://github.com/silist/agent-relay
 
 ### 初始化
 
-在 orchestrator 的 pane 里执行 `relay init`，会自动填入当前 pane 的 `orchestrator_pane`。
+在 orchestrator 的 pane 里执行 `relay orch`（首次可先跑 `relay init` 写默认配置），
 然后在 worker 的 pane 里执行 `relay register`。
+
+两者存的都是**稳定目标** `session:window.pane`，不是 `%N` 这种 pane 编号。
+
+> **为什么不用 pane 编号。** `%3` 是 tmux 的运行时编号，server 一重启就全部分配。
+> 配置里存 `%3`，重启后它要么不存在、要么落到别的窗口上。实测踩过一次：
+> daemon 每秒对着一个已经不存在的 `%3` 重试了 14 次，事件永远派不出去。
+> 存 `session:w.p` 后，tmux 重启不需要改任何配置——名字还在，pane 就找得回来。
+>
+> 万一会话本身被重建、目标也失效了，`relay status` 会显式标 `⚠ 解析不到存活 pane`，
+> 在 orchestrator 里重跑一次 `relay orch` 即可，不用手改 `config.json`。
 
 ### 接入 Claude Code
 
@@ -145,11 +155,12 @@ tmux new-session -d -s relay 'relay daemon'
 | 命令 | 调用方 | 作用 |
 |---|---|---|
 | `relay init` | 人 | 写 `~/.agent-relay/config.json`（在 orchestrator pane 中执行） |
+| `relay orch [pane]` | 人 | 在当前/指定 pane 登记 orchestrator（tmux 重启后跑一次） |
 | `relay register [pane]` | 人 | 把当前/指定 pane 注册为 worker（在 worker pane 中执行） |
 | `relay unregister [pane]` | 人 | 移除 worker |
 | `relay event --src claude\|codex` | hook | 事件入口，**永远退出 0** |
 | `relay decide <worker> <text>` | orchestrator | 回灌决策 |
-| `relay done <worker> <text>` | orchestrator | 标记完成（轮次归零） |
+| `relay done <worker> <text>` | orchestrator | 标记完成（轮次归零），并投递 text；text 为空则只改状态 |
 | `relay escalate <worker> <text>` | orchestrator | 升级给人 |
 | `relay context <worker> [行数]` | orchestrator | 拉取 worker 完整原文（只读） |
 | `relay answer <worker> [text]` | 人 | 回灌决策 / 无 text 仅解除静默 |
@@ -165,7 +176,8 @@ tmux new-session -d -s relay 'relay daemon'
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
-| `worker_panes` | `[]` | 白名单。**空数组 = 拒绝所有事件**，这是安全默认 |
+| `orchestrator_pane` | `""` | orchestrator 的稳定目标（`session:w.p`），用 `relay orch` 写 |
+| `worker_panes` | `[]` | 白名单，同样是稳定目标。**空数组 = 拒绝所有事件**，这是安全默认 |
 | `max_rounds` | 64 | 单任务最大决策轮次，超限升级给人 |
 | `min_dispatch_interval` | 120 | 同 worker 两次派发最小间隔（秒） |
 | `skip_background_tasks` | `true` | worker 有后台任务时不派发 |
@@ -225,6 +237,9 @@ Claude 的 Stop payload 带 `background_tasks`，非空即「本轮结束但任�
 
 `done` 必须归零：否则 worker 做完一个任务就永久停在 `done`，之后的新任务会被静默丢弃。
 
+`done` 的文本会投递给 worker（`[已完成] …`）。只记账、不想惊动 worker 时传空字符串：
+`relay done mp-sql ""`。
+
 ## 邮件回灌的验证
 
 `mail_reply_enabled: true` 后，直接回复升级邮件即可回灌。验证链：
@@ -256,7 +271,8 @@ Message-ID 只出现在发给你的那封信里，伪造者无从得知。
 ```
 
 `dropped.log` 每行 `时间 \t 原因 \t worker`。常见原因：`background-tasks`、`throttled`、
-`not-in-worker-panes`、`is-orchestrator`、`waiting_human`、`empty-message`。
+`not-in-worker-panes`、`is-orchestrator`、`waiting_human`、`empty-message`、
+`worker-pane-gone`（事件所属的 worker 已退出，无法投递）。
 
 ## 已知限制
 
@@ -267,6 +283,8 @@ Message-ID 只出现在发给你的那封信里，伪造者无从得知。
 - **飞书是单向通知**。要能收消息需企业自建应用 + 公网回调地址；回复请用 `relay answer`。
 - **不配 `channels` 时所有故障都是静默的**，只有本地日志。建议至少配一个通知渠道。
 - **paste 后靠一次 Enter 提交**，Claude 与 Codex TUI 实测均可用，但属版本相关行为。
+- **pane 目标靠 `session:window.pane` 定位**。同名会话被重建、或 window/pane 索引变了，
+  需要重跑 `relay orch` / `relay register`。`relay status` 会把这些标成 `⚠`。
 - 未在 Windows / 非 tmux 环境测试。
 
 ## 开发

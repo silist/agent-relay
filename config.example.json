@@ -1,5 +1,5 @@
 {
-  "orchestrator_pane": "%N",
+  "orchestrator_pane": "session:1.1",
   "worker_panes": [],
   "channels": [],
   "feishu_webhook": "",

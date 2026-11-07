@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+### 修复
+
+- **pane 用稳定目标而不是 `%N`**。tmux server 重启后 pane 编号会重排，配置里存的
+  `%3` 变成无效 target，daemon 每秒重试同一件事、事件永远派不出去。现在
+  `orchestrator_pane` / `worker_panes` 都存 `session:window.pane`，使用时再解析。
+- **worker 的 pane 已退出时直接丢弃事件**，不再无限重试（`dropped.log` 记
+  `worker-pane-gone`）。
+- **orchestrator 解析不到时不再丢事件**：保留在 inbox 等重新登记，且告警只记一次。
+- **`relay done` 带文本时会投递给 worker**。此前它只改本地状态，文本被静默丢弃，
+  orchestrator 以为交代过、worker 一个字都没收到。带空文本仍为纯记账。
+- **`looks_like_request` 补句式**。「等你的授权」「待您确认」「是否继续」这类请求
+  不被识别，会被当成空转压进 `pending/` 排队一小时。新增 5 组句式覆盖「等人给东西」
+  和「向人提问」。这类枚举必有漏网，所以 `pending_slack` 兜底保留。
+
+### 新增
+
+- `relay orch [pane]`：在 orchestrator 的 pane 里登记自己，与 `relay register` 对称。
+  tmux 重启后跑一次即可，不用手改 `config.json`。
+- `relay status` 会标出解析不到的目标（`⚠ 解析不到存活 pane` / `⚠ 已退出`）。
+
 ## 0.1.0 — 2026-11-06
 
 首个可发布版本。从一份设计文档落地为可运行的实现，并在真实的多 agent 部署中跑通。

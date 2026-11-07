@@ -15,22 +15,36 @@ tmux（pane 解析、bracketed paste）
 hook 入口（cmd_event）
 orchestrator / 人的指令（enqueue、cmd_answer、cmd_context）
 daemon（dispatch / apply_outbox / check_timeout / check_pending）
-运维命令（init / register / status）
+运维命令（init / orch / register / status）
 ```
 
-## 五条不可破坏的约束
+## 六条不可破坏的约束
 
-### 1. `relay event` 永远退出 0，且不能阻塞
+### 1. pane 用稳定目标，不要存 `%N`
+
+`%N` 是 tmux 的运行时编号，**server 重启后全部重排**。配置里存 `%3`，重启后它
+要么不存在、要么指向别的窗口。真实事故：daemon 每秒对着一个不存在的 `%3`
+重试，14 次之后被人发现，worker 的事件一直派不出去。
+
+所以 `orchestrator_pane` / `worker_panes` 里存的是 `session:window.pane`，
+用的时候才经 `resolve_pane()` 解析成当前 id。新增任何「记住某个 pane」的地方
+都要走这两个函数，不要直接存 `os.environ["TMUX_PANE"]`。
+
+注意 `resolve_pane()` 只保证「这个 target 现在指向某个活着的 pane」。tmux 对
+越界索引会**静默钳制**（`sess:1.9` → 该窗口最后一个 pane），所以它够用作白名单
+判定，不够用作身份识别。
+
+### 2. `relay event` 永远退出 0，且不能阻塞
 
 它跑在 worker 的 Stop hook 路径上。任何异常、任何阻塞都会卡住被 hook 的 agent。
 `cmd_event` 整体包在 try/except 里，stdin 读取有 3 秒 select 超时——这两层都不能破坏。
 
-### 2. daemon 是 `state.json` 的唯一写者
+### 3. daemon 是 `state.json` 的唯一写者
 
 `relay decide/done/escalate/answer` 都只写 `outbox/`，由 daemon 统一 apply。
 不要在 CLI 侧直接改 state。
 
-### 3. `dangerous_regex` 只放不可逆操作
+### 4. `dangerous_regex` 只放不可逆操作
 
 「部署」「删除」「付款」这类动词同样出现在「禁止部署」「不要删除」这类否定句里，
 正则分不出来，会把合法决策静默拦截。
@@ -38,12 +52,12 @@ daemon（dispatch / apply_outbox / check_timeout / check_pending）
 真实事故：orchestrator 写「禁止部署、生产写入」，命中 `部署.*生产`，整条决策被拦，
 worker 永远等不到回复，只留一行本地日志。这类词放 `caution_regex`，只标注不拦截。
 
-### 4. 未知 worker 的 `decide` 必须拒绝
+### 5. 未知 worker 的 `decide` 必须拒绝
 
 曾用 in-flight 的 pane 兜底，结果 orchestrator 打错 worker 名时，决策被投进了另一个
 worker 的 pane。误路由比失败更糟——失败至少有日志。
 
-### 5. 过滤掉的不是「不需要决策」，而是「还没到决策的时机」
+### 6. 过滤掉的不是「不需要决策」，而是「还没到决策的时机」
 
 `background_tasks` 非空 = 本轮思考结束但任务在跑。这类事件进 `pending/`，
 靠 `pending_slack` 兜底补派。
