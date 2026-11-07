@@ -178,7 +178,6 @@ tmux new-session -d -s relay 'relay daemon'
 |---|---|---|
 | `orchestrator_pane` | `""` | orchestrator 的稳定目标（`session:w.p`），用 `relay orch` 写 |
 | `worker_panes` | `[]` | 白名单，同样是稳定目标。**空数组 = 拒绝所有事件**，这是安全默认 |
-| `max_rounds` | 64 | 单任务最大决策轮次，超限升级给人 |
 | `min_dispatch_interval` | 120 | 同 worker 两次派发最小间隔（秒） |
 | `skip_background_tasks` | `true` | worker 有后台任务时不派发 |
 | `pending_slack` | 600 | 被过滤事件的兜底补派延迟（秒） |
@@ -199,10 +198,19 @@ tmux new-session -d -s relay 'relay daemon'
 
 | 风险 | 措施 |
 |---|---|
-| 死循环 | `max_rounds` 超限升级 |
 | 空转 | `skip_background_tasks`：worker 有后台任务时 Stop 不派发 |
 | 频繁空转 | `min_dispatch_interval` 节流 |
 | 兜底恢复 | `pending_slack`：被过滤事件超时后补派，防死锁 |
+
+**没有轮次上限。** 曾经有一个 `max_rounds`（默认 64），已移除：它假设 `rounds`
+能标识「同一个任务」，但代码里既没有判断「是不是同一个问题」的逻辑，也没有
+「开新任务就释放轮次」的入口（`rounds` 只在 `done`/`answer` 时归零）。结果是
+单调递增的计数器——跑到上限后每次 Stop 都升级给人，而 `decide` 仍在回灌并继续
+`rounds += 1`，worker 被永久锁死在 `waiting_human`，之后所有输出都不再进
+orchestrator。真实事故：mp-sql 跑到 68 轮后彻底失联。
+
+`rounds` 现在只作计数展示，不参与任何判断。要中断循环，用 `relay escalate`
+或直接 `relay answer`。
 | 乱批不可逆操作 | `dangerous_regex` 拦截 |
 | orchestrator 无响应 | `timeout` 后升级 |
 | 升级期间重复打扰 | `waiting_human` 时丢弃该 worker 的新事件 |
@@ -225,13 +233,14 @@ Claude 的 Stop payload 带 `background_tasks`，非空即「本轮结束但任�
 ## 轮次计数规则
 
 `rounds` 表示「orchestrator 已经给过多少次决策」，不是「worker 停了几次」。
+**它只作计数展示，不参与任何判断**——没有轮次上限。
 
 | 动作 | rounds | status |
 |---|---|---|
 | `decide` | +1 | running |
 | `done` | 归零 | idle |
 | `answer` | 归零 | running / idle |
-| `escalate` / 超时 / 达上限 | 不变 | waiting_human |
+| `escalate` / 超时 | 不变 | waiting_human |
 
 被过滤的事件（后台任务、节流、白名单外、空消息）**不消耗轮次**。
 

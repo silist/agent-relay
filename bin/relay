@@ -41,7 +41,6 @@ DEFAULTS = {
     "feishu_webhook": "",
     "email": {"host": "", "port": 465, "user": "", "password": "", "to": "",
               "imap_host": "", "imap_port": 993, "from_whitelist": []},
-    "max_rounds": 64,
     "min_dispatch_interval": 120,
     "skip_background_tasks": True,
     "pending_slack": 600,
@@ -858,11 +857,15 @@ def check_pending(state, cfg):
             continue
         st = state["workers"].get(worker, {})
         if st.get("status") in ("waiting_human", "done"):
+            # 不能静默 unlink。曾经这里连 dropped.log 都不写，worker 的输出
+            # 就这样无声消失，排查时只能靠猜。至少要留下证据。
             os.unlink(path)
+            dropped(f"pending-{st.get('status')}", worker)
+            log(f"丢弃 {worker} 的兜底事件：状态为 {st.get('status')}，不再派发")
             continue
         if state.get("in_flight"):
             continue  # orchestrator 正忙，下轮再说
-        # 放回 inbox 走正常派发，由 dispatch 的轮次上限管着
+        # 放回 inbox 走正常派发
         os.replace(path, os.path.join(INBOX, name))
         st["last_dispatch"] = 0  # 兜底事件不受节流阻挡
         state["workers"][worker] = st
@@ -938,13 +941,18 @@ def dispatch(state, cfg):
         dropped("waiting_human", worker)
         return
 
-    # done 现在只代表「上一个任务结束」，随后 done 分支已把状态重置为 idle，
-    # 所以这里不再拦截——worker 开启新任务时事件应当正常派发。
-    rounds, maxr = int(st.get("rounds", 0)), int(cfg.get("max_rounds", 64))
-    if rounds >= maxr:
-        os.unlink(path)
-        do_escalate(state, cfg, worker, pane, f"达到轮次上限 {maxr}", ev.get("text", ""))
-        return
+    # 这里曾经有「达到 max_rounds 就升级给人」的保护，已移除。
+    # 它假设 rounds 能标识「同一个任务」——但代码里既没有判断「是不是同一个问题」
+    # 的逻辑，也没有「开新任务就释放轮次」的入口（rounds 只在 done/answer 时归零）。
+    # 结果是单调递增的计数器：跑到上限后每次 Stop 都升级，而 decide 仍在回灌并
+    # 继续 rounds += 1，worker 被永久锁死在 waiting_human，再也派不出去。
+    # 真实事故：mp-sql 跑到 68 轮后，之后所有输出都不再进 orchestrator。
+    # rounds 现在纯粹是观测用的计数，不参与任何判断。
+
+    # rounds 只作计数展示，不参与任何判断。必须在这里读出来——
+    # 删 max_rounds 时连它一起删掉过一次，dispatch 直接 NameError，
+    # 整整一轮 worker 输出没派出去。
+    rounds = int(st.get("rounds", 0))
 
     # 节流只对「拿不到 background_tasks」的源生效。
     #
@@ -982,13 +990,12 @@ def dispatch(state, cfg):
         return
 
     tail = (ev.get("text") or "")[-int(cfg.get("worker_tail_chars", 2000)):]
-    budget = (f"还有 {maxr - rounds - 1} 轮余量，不必这一轮就拍板。"
-              if maxr - rounds > 1 else
-              "这是最后一轮，下一条必须给出可执行结论或明确升级。")
-    msg = (f"[RELAY {rounds + 1}/{maxr}] worker={worker} pane={pane} "
-           f"cwd={ev.get('cwd')} src={ev.get('src')}\n"
+    # 不再有轮次上限，所以不再写「还有 N 轮余量 / 这是最后一轮」。
+    # 那种话术只会让 orchestrator 在后期倾向于草率拍板或直接升级。
+    msg = (f"[RELAY {rounds + 1}] worker={worker} pane={pane} "
+           f"cwd={ev.get('cwd')} src={ev.get('src')} "
+           f"（该 worker 累计第 {rounds + 1} 次决策，仅作计数）\n"
            f"--- worker 最后输出（末尾 {len(tail)} 字，可能被截断）---\n{tail}\n---\n"
-           f"{budget}\n"
            f"先独立判断，不要跳过推理：\n"
            f"  · 它到底卡在什么上？是缺决策，还是在等异步事件（备份/CI/Monitor）？\n"
            f"  · 你的决定会影响什么？哪个选项可回滚？\n"
@@ -1023,7 +1030,7 @@ def dispatch(state, cfg):
     state["in_flight"] = {"worker": worker, "pane": pane,
                           "since": time.time(), "rounds": rounds}
     save_state(state)
-    log(f"派发 {worker} -> orchestrator（轮次 {rounds + 1}/{maxr}）")
+    log(f"派发 {worker} -> orchestrator（第 {rounds + 1} 次决策）")
 
 
 def apply_outbox(state, cfg):
@@ -1356,7 +1363,7 @@ def cmd_status():
           + (", ".join(f"{p} [{pane_label(resolve_pane(p))}]" if resolve_pane(p)
                        else f"{p} ⚠ 已失效" for p in (cfg.get("worker_panes") or []))
              or "(无，事件全部拒绝)"))
-    print(f"max_rounds   : {cfg.get('max_rounds')}   timeout: {cfg.get('timeout')}s")
+    print(f"timeout      : {cfg.get('timeout')}s")
     print(f"in_flight    : " + (f"{inf['worker']} ({time.time() - inf['since']:.0f}s)" if inf else "-"))
     print(f"inbox/outbox : {n_in} / {n_out}    dropped: {n_drop}")
     if state["workers"]:

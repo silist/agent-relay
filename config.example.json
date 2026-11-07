@@ -13,7 +13,6 @@
     "imap_port": 993,
     "from_whitelist": []
   },
-  "max_rounds": 64,
   "timeout": 900,
   "min_dispatch_interval": 300,
   "skip_background_tasks": true,
