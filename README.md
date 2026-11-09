@@ -249,6 +249,9 @@ Claude 的 Stop payload 带 `background_tasks`，非空即「本轮结束但任�
 `done` 的文本会投递给 worker（`[已完成] …`）。只记账、不想惊动 worker 时传空字符串：
 `relay done mp-sql ""`。
 
+空文本的 `done` 也**不发完成通知**。否则一次收尾会有两封邮件：worker 的完成摘要一封，
+orchestrator 对它的空确认又一封——后者没有信息量。`notify_done` 只管有内容的 `done`。
+
 ## 邮件回灌的验证
 
 `mail_reply_enabled: true` 后，直接回复升级邮件即可回灌。验证链：

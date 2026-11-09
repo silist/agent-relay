@@ -20,6 +20,11 @@
   个单调递增的计数器：到上限后每次 Stop 都升级，而 `decide` 仍回灌并继续 `rounds += 1`，
   worker 被永久锁死在 `waiting_human`。真实事故：mp-sql 到 68 轮后彻底失联。
   `rounds` 现在只作计数展示。
+- **空文本的 `done` 不再发完成通知**。`done` 现在会投递文本，worker 收到后再次
+  Stop，orchestrator 常以 `relay done <worker> ""` 收尾——而 `notify_done` 无条件
+  发信、用 `(无摘要)` 兜底，于是一次真实收尾收到两封邮件。现在无内容则不通知。
+- **`done` 判定统一用 `text.strip()`**。此前 paste 用 `text`、通知用 `text.strip()`，
+  纯空白文本会一边被 paste 出去、一边跳过通知。
 
 ### 新增
 

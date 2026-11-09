@@ -1111,7 +1111,10 @@ def apply_outbox(state, cfg):
             # 想到 done 的消息会落进黑洞。
             #
             # 和 decide 一样走重试：投递失败不能静默吞掉指令。
-            if text and pane:
+            # 用 strip 后的结果判定「有没有话要交代」——否则纯空白文本会
+            # 一边被当成有内容 paste 出去，一边又被当成空文本跳过通知。
+            has_text = bool(text.strip())
+            if has_text and pane:
                 if not paste(pane, f"[已完成] {text}\n"
                                    f"（orchestrator 认为本轮结束；如仍有指示，以上为准）"):
                     retry_or_drop(path, cmd, tries, cfg, state, worker, pane,
@@ -1123,10 +1126,14 @@ def apply_outbox(state, cfg):
             save_state(state)
             os.unlink(path)
             log(f"{worker} 已完成，轮次清零回到 idle"
-                + ("（已投递收尾说明）" if text and pane else "")
+                + ("（已投递收尾说明）" if has_text and pane else "")
                 + f": {text}")
-            if cfg.get("notify_done"):
-                notify(f"[relay] {worker} 已完成", text or "(无摘要)")
+            # 空文本的 done 是纯记账（orchestrator 对 worker 的收尾做个了断，
+            # 没有话要交代），不该产生通知。曾经这里无条件发信、用 "(无摘要)"
+            # 兜底，结果一次真实收尾会收到两封邮件：worker 的完成摘要一封，
+            # orchestrator 的空确认又一封。后者没有信息量，只是噪音。
+            if cfg.get("notify_done") and has_text:
+                notify(f"[relay] {worker} 已完成", text)
         elif action == "escalate":
             os.unlink(path)
             do_escalate(state, cfg, worker, pane, "orchestrator 请求人工决策", text)
