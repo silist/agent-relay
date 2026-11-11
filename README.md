@@ -155,8 +155,8 @@ tmux new-session -d -s relay 'relay daemon'
 | 命令 | 调用方 | 作用 |
 |---|---|---|
 | `relay init` | 人 | 写 `~/.agent-relay/config.json`（在 orchestrator pane 中执行） |
-| `relay orch [pane]` | 人 | 在当前/指定 pane 登记 orchestrator（tmux 重启后跑一次） |
-| `relay register [pane]` | 人 | 把当前/指定 pane 注册为 worker（在 worker pane 中执行） |
+| `relay orch [pane]` | 人 | 登记 orchestrator，并把角色职责送到那个 pane |
+| `relay register [pane]` | 人 | 注册 worker，并把角色职责送到那个 pane |
 | `relay unregister [pane]` | 人 | 移除 worker |
 | `relay event --src claude\|codex` | hook | 事件入口，**永远退出 0** |
 | `relay decide <worker> <text>` | orchestrator | 回灌决策 |
@@ -190,9 +190,26 @@ relay templates show dispatch
 | `decide` / `done` / `answer` | 回灌给 worker 的三类指令前缀 |
 | `caution` | 命中 `caution_regex` 时追加的提示 |
 | `escalate` | 升级给人的通知正文 |
+| `role_orch` | 执行 `relay orch` 时 paste 到 orchestrator pane 的角色职责 |
+| `role_worker` | 执行 `relay register` 时 paste 到 worker pane 的角色职责 |
 
 占位符用 `{name}`（如 `{worker}`、`{text}`、`{tail}`）。要写裸花括号用 `{{` `}}`。
 模板缺占位符、格式错误或为空时回落内置默认并写日志——派发不会中断。
+
+### 角色职责是注册的一部分
+
+`relay orch` / `relay register` 不只是写 `config.json`，还会把 `role_orch` /
+`role_worker` 模板 paste 到对应 pane，让那个 agent 知道自己的角色、`[RELAY ...]`
+协议和消息前缀的含义。此前这一步完全缺失，职责只散落在 codex 的
+`developer_instructions` 和 README 里，改一处漏一处。
+
+`paste()` 会带一次 Enter，等于**唤醒那个 agent**——这是刻意的，角色说明必须进
+它的上下文才算送达。重复执行（如 tmux 重启后重登记）会再送一次，可用
+`relay templates export` 后把对应模板改短来控制打扰。送达失败只写日志、不回滚
+登记，重跑一次该命令即可。
+
+codex 的全局 `developer_instructions` 仍保留一份精简的启动期注入（保证上下文
+被压缩后仍认得协议），但注释里已指向模板；改协议请改模板，不要两处各写一份。
 
 ## 配置要点
 

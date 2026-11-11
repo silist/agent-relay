@@ -82,6 +82,11 @@ worker 的 pane。误路由比失败更糟——失败至少有日志。
 模板缺占位符、格式错误或为空时会**回落内置默认并写日志**——派发不会因此中断，
 但你会看到一条 `模板 xxx ... 使用内置默认`。改完模板记得看这条有没有出现。
 
+`relay orch` / `relay register` 会把 `role_orch` / `role_worker` paste 到对应 pane，
+这是 agent 得知自己角色与 `[RELAY ...]` 协议的**唯一动态来源**。不要在
+codex 全局 `developer_instructions`、README 或源码里另写一份协议正文——
+那份只留启动期最小注入并指向模板，两处各写一份必然漂移。
+
 ## 测试
 
 历史验证方式是手工 + 隔离 HOME：

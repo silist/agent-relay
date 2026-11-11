@@ -40,6 +40,12 @@
   追加到 DECISIONS.md」，导致实施过程、复核结论、测试证据全堆进一个文件——实测
   涨到 1 MB / 17801 行，编号重复且乱序。现在改为只在授权范围、禁止项或取舍定案
   变化时更新决策记录，过程性内容留在项目既有的交接/状态文档。
+- **注册时把角色职责送到 agent**。`relay orch` / `relay register` 原先只写
+  `config.json`，agent 完全不知道自己被登记成什么角色；职责散落在 codex 全局
+  `developer_instructions` 和 README 里，改一处漏一处。现在新增 `role_orch` /
+  `role_worker` 模板，注册时 paste 到对应 pane，与 `[RELAY ...]` 协议同源可编辑。
+  `paste()` 带一次 Enter 会唤醒 agent，这是刻意的；送达失败只写日志、不回滚登记。
+  同时清掉 codex 全局配置里残留的「追加 DECISIONS.md」，并让注释指向模板。
 
 ## 0.1.0 — 2026-11-06
 

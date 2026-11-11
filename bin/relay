@@ -126,6 +126,44 @@ TEMPLATES = {
         "回复方式:\n{how}"
         "若需直接在 tmux 里接手:\n  relay answer {worker}\n"
     ),
+    # 登记 orchestrator 时 paste 到那个 pane 的角色职责说明。
+    # 这份文本与 dispatch 模板同源：改协议只改这里，不要再去改 codex 全局配置。
+    "role_orch": (
+        "[RELAY 角色说明] 你已被登记为 orchestrator"
+        "（pane {pane}，稳定目标 {target}）。\n\n"
+        "职责：管理 worker 的工作。worker 停下并需要决策时，relay daemon 会把它的\n"
+        "输出转给你，消息以 `[RELAY ` 开头——那不是用户在提问，别当成闲聊。\n\n"
+        "收到 [RELAY ...] 后先判断，然后只发下面其中一条命令，结束本轮：\n"
+        "    relay decide <worker> \"<决策>\"\n"
+        "    relay done <worker> \"<完成摘要>\"\n"
+        "    relay escalate <worker> \"<背景 / 已尝试方案 / A|B|C 选项与推荐>\"\n\n"
+        "默认用 decide。只在三种情况 escalate：\n"
+        "  1) worker 在等 A/B 选择，你无法从既有任务目标里判断；\n"
+        "  2) 需要扩大授权——新的权限、新的范围、超出该任务既有授权的事；\n"
+        "  3) 出现你无法判断后果的异常（数据损坏、状态不一致、越界操作）。\n\n"
+        "不要因为这些升级：「信息不完整」（用 `relay context <worker> [行数]` 拉全文）、\n"
+        "「涉及生产」（已授权任务内的生产操作不算扩大授权）、\n"
+        "「保险起见」（人已经回答过的问题不要重复升级；同一个问题只升级一次）。\n\n"
+        "命令只把指令写进 ~/.agent-relay/outbox/，由 daemon 送达；执行完立刻返回是正常的。\n"
+        "只在授权范围、禁止项或取舍定案变化时才更新项目的决策记录；实施进度、复核结论、\n"
+        "测试证据写进项目既有的交接/状态文档，不要每轮追加。\n\n"
+        "本条只是角色说明，不需要回复，也不要因此执行命令。"
+    ),
+    # 登记 worker 时 paste 到那个 pane 的角色职责说明。
+    "role_worker": (
+        "[RELAY 角色说明] 你已被登记为 worker"
+        "（名称 {label}，pane {pane}，稳定目标 {target}）。\n\n"
+        "职责：按 orchestrator 的决策推进工作，需要决策或完成阶段时停下。\n\n"
+        "你的 Stop hook 会把最后输出交给 relay，由 daemon 转给 orchestrator。\n"
+        "所以「等决策」时不要自行猜测、也不要空转等待——停下即可，\n"
+        "回复会由 relay 送回来。\n\n"
+        "来自 relay 的消息按前缀理解，照它继续工作：\n"
+        "    [决策] ...      orchestrator 的决策\n"
+        "    [已完成] ...    orchestrator 认为本轮结束（若仍有指示，以文本为准）\n"
+        "    [人工决策] ...  人的决策\n\n"
+        "不要自己调用 relay 命令回灌决策，那是 orchestrator 的职责。\n\n"
+        "本条只是角色说明，不需要回复，也不要因此执行命令。"
+    ),
 }
 
 TPL_DIR = os.path.join(BASE, "templates")
@@ -1358,8 +1396,27 @@ def count_lines(path):
         return 0
 
 
+def brief_role(kind, pid, store, cfg, **kw):
+    """把角色职责说明 paste 到刚登记的 pane。
+
+    以前 register/orch 只写 config.json，agent 完全不知道自己被登记成什么角色；
+    职责散落在 codex 全局 developer_instructions 和 README 里，改一处漏一处。
+    现在与 [RELAY ...] 协议同源，都走模板。
+
+    paste 会带一次 Enter，等于唤醒那个 agent——这是刻意的：角色说明必须进它的
+    上下文才算送达。失败不阻断登记（配置已经写好了），但要大声记日志。
+    """
+    text = render_template(kind, cfg, pane=pid, target=store, **kw)
+    if not paste(pid, text):
+        log(f"角色说明 paste 失败 pane={pid} kind={kind}（登记本身已生效）")
+        print(f"警告：角色说明未能送达 {pid}，可重跑本命令重试", file=sys.stderr)
+        return False
+    print(f"已把 {kind} 角色说明送到 {pid}")
+    return True
+
+
 def cmd_register(argv):
-    """把 pane 加入 worker 白名单。在 worker pane 内执行即注册自身。
+    """把 pane 加入 worker 白名单，并把 worker 角色说明送到那个 pane。
 
     存的是稳定目标（session:w.p）而不是 `%N`，tmux 重启后仍能解析回同一个窗口。
     """
@@ -1390,12 +1447,14 @@ def cmd_register(argv):
             print(f"已更新 {pane_label(pid)}: {old} -> {store}（原为运行时编号）")
         else:
             print(f"已注册: {pane_label(pid)} ({pid})")
+        brief_role("role_worker", pid, store, cfg, label=pane_label(pid))
         return 0
     panes.append(store)
     cfg["worker_panes"] = panes
     ensure_dirs()
     save_json(CONFIG_PATH, cfg)
     print(f"已注册 worker: {pane_label(pane)} ({pid} = {store})，共 {len(panes)} 个")
+    brief_role("role_worker", pid, store, cfg, label=pane_label(pid))
     return 0
 
 
@@ -1423,6 +1482,7 @@ def cmd_orch(argv):
     save_json(CONFIG_PATH, cfg)
     print(f"已登记 orchestrator: {pane_label(pid)} ({pid} = {store})")
     print(f"worker_panes 现有 {len(cfg['worker_panes'])} 个")
+    brief_role("role_orch", pid, store, cfg)
     return 0
 
 
@@ -1488,7 +1548,7 @@ def cmd_templates(argv):
         for kind in sorted(TEMPLATES):
             path = _tpl_file(kind, cfg)
             src = path if path else "(内置默认)"
-            print(f"  {kind:<10} {src}")
+            print(f"  {kind:<12} {src}")
         print("\n用 `relay templates export` 导出为可编辑文件，"
               "`relay templates show <kind>` 查看当前生效内容。")
         return 0
@@ -1529,8 +1589,8 @@ def cmd_templates(argv):
 USAGE = """agent-relay — 多 agent tmux 编排中继
 
   relay init                       写入 ~/.agent-relay/config.json（在 orchestrator pane 中执行）
-  relay orch [pane]                在当前/指定 pane 登记 orchestrator（tmux 重启后跑一次）
-  relay register [pane]            把当前/指定 pane 注册为 worker（在 worker pane 中执行）
+  relay orch [pane]                登记 orchestrator，并把角色职责送到那个 pane
+  relay register [pane]            注册 worker，并把角色职责送到那个 pane
   relay unregister [pane]          移除 worker 白名单项
   relay event --src claude|codex   hook 入口（由 hook 调用）
   relay decide <worker> <text>     orchestrator: 回灌决策
