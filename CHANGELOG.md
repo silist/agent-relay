@@ -31,6 +31,15 @@
 - `relay orch [pane]`：在 orchestrator 的 pane 里登记自己，与 `relay register` 对称。
   tmux 重启后跑一次即可，不用手改 `config.json`。
 - `relay status` 会标出解析不到的目标（`⚠ 解析不到存活 pane` / `⚠ 已退出`）。
+- **`relay templates`：提示词模板可编辑**。派发消息、决策回灌、升级通知的文本原先
+  硬编码在 `bin/relay` 里，改一句要动源码。现在抽成 `TEMPLATES` 并支持
+  `~/.agent-relay/templates/*.txt` 覆盖：`relay templates export` 导出后直接编辑，
+  下一轮 tick 生效、无需重启。模板缺失/格式错误/缺占位符时回落内置默认并写日志，
+  派发不会中断。
+- **派发提示词不再要求每轮追加 `DECISIONS.md`**。原先末尾固定写「决策后把结论
+  追加到 DECISIONS.md」，导致实施过程、复核结论、测试证据全堆进一个文件——实测
+  涨到 1 MB / 17801 行，编号重复且乱序。现在改为只在授权范围、禁止项或取舍定案
+  变化时更新决策记录，过程性内容留在项目既有的交接/状态文档。
 
 ## 0.1.0 — 2026-11-06
 

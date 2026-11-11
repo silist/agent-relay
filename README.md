@@ -164,11 +164,35 @@ tmux new-session -d -s relay 'relay daemon'
 | `relay escalate <worker> <text>` | orchestrator | 升级给人 |
 | `relay context <worker> [行数]` | orchestrator | 拉取 worker 完整原文（只读） |
 | `relay answer <worker> [text]` | 人 | 回灌决策 / 无 text 仅解除静默 |
+| `relay templates [list\|export\|show]` | 人 | 查看/导出可编辑的提示词模板 |
 | `relay daemon` | 常驻 | 调度主循环 |
 | `relay status` | 人 | 查看状态 |
 
 `relay context` 是为「信息不足」准备的：派发时只附 worker 输出的末尾一段，常会截掉结论。
 与其让 orchestrator 凭半截信息猜或直接升级，不如给它一个主动拉取全文的命令。
+
+## 提示词模板
+
+派发给 orchestrator 的消息、回灌给 worker 的决策、升级通知的正文，都在
+`~/.agent-relay/templates/*.txt` 里，可以直接编辑：
+
+```bash
+relay templates            # 列出每个模板的来源（内置默认 / 哪个文件）
+relay templates export     # 把内置默认导出成文件，之后直接编辑
+relay templates show dispatch
+```
+
+改完**不用重启 daemon**，下一轮 tick 就生效。可编辑的是：
+
+| 模板 | 作用 |
+|---|---|
+| `dispatch` | orchestrator 收到的派发消息（决定它的行为，最常改） |
+| `decide` / `done` / `answer` | 回灌给 worker 的三类指令前缀 |
+| `caution` | 命中 `caution_regex` 时追加的提示 |
+| `escalate` | 升级给人的通知正文 |
+
+占位符用 `{name}`（如 `{worker}`、`{text}`、`{tail}`）。要写裸花括号用 `{{` `}}`。
+模板缺占位符、格式错误或为空时回落内置默认并写日志——派发不会中断。
 
 ## 配置要点
 

@@ -59,7 +59,122 @@ DEFAULTS = {
     "escalate_tail_chars": 1500,
     "imap_poll_interval": 30,
     "mail_reply_enabled": False,
+    "templates_dir": "",
 }
+
+# ---------------------------------------------------------------- 提示词模板
+#
+# 这些文本直接决定 orchestrator 的行为，改错会静默降低决策质量（见 AGENTS.md
+# 「改 prompt 要谨慎」）。放成独立文件是为了能直接编辑、能 diff、能回滚，
+# 而不用改 Python 源码。
+#
+# 加载顺序（后者覆盖前者）：
+#   1. 这里的 DEFAULTS_TEXT（保证任何情况下都有可用文本）
+#   2. ~/.agent-relay/templates/ 下同名文件
+#   3. config.json 的 templates_dir 指向的目录下同名文件
+#
+# 占位符用单花括号 {name}；想写裸花括号（JSON 示例等）用双花括号 {{ }}。
+# 未知占位符视为模板错误，回落到内置默认并写日志（不静默吞掉，避免笔误无感知）。
+# 模板文件损坏/缺占位符时同样回落——派发不能因此中断。
+
+TEMPLATES = {
+    # orchestrator 收到的派发消息。占位符见 dispatch()。
+    "dispatch": (
+        "[RELAY {round}] worker={worker} pane={pane} cwd={cwd} src={src}"
+        "（该 worker 累计第 {round} 次决策，仅作计数）\n"
+        "--- worker 最后输出（末尾 {tail_chars} 字，可能被截断）---\n{tail}\n---\n"
+        "先独立判断，不要跳过推理：\n"
+        "  · 它到底卡在什么上？是缺决策，还是在等异步事件（备份/CI/Monitor）？\n"
+        "  · 你的决定会影响什么？哪个选项可回滚？\n"
+        "需要更多原文时，用 `relay context {worker} [行数]` 拉取，别靠猜。\n"
+        "\n"
+        "升级给人的判断标准（从严，默认用 decide）：\n"
+        "  只在三种情况 escalate：\n"
+        "    1) worker 在等 A / B 选择，而你没有办法从既有目标里判断；\n"
+        "    2) 需要扩大授权——新的权限、新的范围、超出该任务既有授权的事；\n"
+        "    3) 出现你无法判断后果的异常（数据损坏、状态不一致、越界操作）。\n"
+        "  不要因为这些升级：\n"
+        "    · 「信息不完整」。worker 正在推进、有连续输出、或在执行已授权步骤时，\n"
+        "      它就是正常在工作，继续用 decide 让它往下走。\n"
+        "    · 「涉及生产」。已授权任务*内*的生产操作不算扩大授权，不要再确认。\n"
+        "    · 「保险起见」。人已经回答过的问题不要重复升级；同一个问题只升级一次。\n"
+        "\n"
+        "想清楚之后，发下面**其中一条**命令（格式要精确）：\n"
+        "  relay decide {worker} \"<决策>\"\n"
+        "  relay done {worker} \"<完成摘要>\"\n"
+        "  relay escalate {worker} \"<背景 / 已尝试方案 / A|B|C 选项与推荐>\"\n"
+        "decide 和 done 都会把这段文本发给 worker；两者都只改本地状态、不给 worker\n"
+        "发文本的用法是 relay done {worker} \"\"。\n"
+        "只在授权范围、禁止项或取舍定案发生变化时才更新项目里的决策记录；"
+        "普通的实施进度、复核结论、测试证据写进项目既有的交接/状态文档，"
+        "不要每轮都追加。"
+    ),
+    # 决策回灌给 worker
+    "decide": "[决策] {text}\n{caution}\n（这是 orchestrator 的决策，请据此继续。）",
+    # done 带文本时回灌给 worker
+    "done": "[已完成] {text}\n（orchestrator 认为本轮结束；如仍有指示，以上为准）",
+    # 人工 answer 回灌给 worker
+    "answer": "[人工决策] {text}\n\n（这是人给出的决策，请据此继续。）",
+    # 命中 caution_regex 时追加的提示（decide 模板里的 {caution}）
+    "caution": "\n[提示] 决策文本含部署/生产相关字样，已照常下达、未拦截。请自行确认不越权。",
+    # 升级给人的通知正文
+    "escalate": (
+        "worker: {worker} (pane {pane})\n"
+        "工单: {token}\n"
+        "原因: {reason}\n\n"
+        "--- worker 最后输出 ---\n{tail}\n---\n\n"
+        "回复方式:\n{how}"
+        "若需直接在 tmux 里接手:\n  relay answer {worker}\n"
+    ),
+}
+
+TPL_DIR = os.path.join(BASE, "templates")
+_tpl_warned = set()
+
+
+def _tpl_file(kind, cfg):
+    """返回某个模板实际使用的文件路径，没有文件则返回空串。"""
+    for d in (cfg.get("templates_dir") or "", TPL_DIR):
+        if not d:
+            continue
+        p = os.path.join(os.path.expanduser(d), f"{kind}.txt")
+        if os.path.exists(p):
+            return p
+    return ""
+
+
+def render_template(kind, cfg, **kw):
+    """取模板并填占位符。任何异常都回落内置默认，绝不因此中断派发。"""
+    text = TEMPLATES[kind]
+    path = _tpl_file(kind, cfg)
+    if path:
+        try:
+            with open(path, encoding="utf-8") as f:
+                loaded = f.read()
+            if loaded.strip():
+                text = loaded
+            else:
+                if kind not in _tpl_warned:
+                    _tpl_warned.add(kind)
+                    log(f"模板 {path} 为空，使用内置默认")
+        except Exception as exc:
+            if kind not in _tpl_warned:
+                _tpl_warned.add(kind)
+                log(f"读取模板 {path} 失败，使用内置默认: {exc}")
+    try:
+        out = text.format(**kw)
+    except KeyError as exc:
+        if kind not in _tpl_warned:
+            _tpl_warned.add(kind)
+            log(f"模板 {kind} 缺占位符 {exc}，使用内置默认")
+        out = TEMPLATES[kind].format(**kw)
+    except (IndexError, ValueError) as exc:
+        # 模板里出现裸 { 或多余 } 时会走到这里
+        if kind not in _tpl_warned:
+            _tpl_warned.add(kind)
+            log(f"模板 {kind} 格式错误（{exc}），使用内置默认")
+        out = TEMPLATES[kind].format(**kw)
+    return out
 
 
 # ---------------------------------------------------------------- 基础设施
@@ -358,12 +473,9 @@ def escalate_body(cfg, worker, pane, reason, text, reply_token=""):
     if reply_token:
         how = (f"  【推荐】直接回复本邮件，正文即决策（只认白名单发件人）\n"
                f"  或执行：relay answer {worker} \"<你的决策>\"\n")
-    return (f"worker: {worker} (pane {pane})\n"
-            f"工单: {reply_token or '(无)'}\n"
-            f"原因: {reason}\n\n"
-            f"--- worker 最后输出 ---\n{tail}\n---\n\n"
-            f"回复方式:\n{how}"
-            f"若需直接在 tmux 里接手:\n  relay answer {worker}\n")
+    return render_template("escalate", cfg, worker=worker, pane=pane,
+                           token=reply_token or "(无)", reason=reason,
+                           tail=tail, how=how)
 
 
 # ---------------------------------------------------------------- 邮件回灌（IMAP）
@@ -990,35 +1102,13 @@ def dispatch(state, cfg):
         return
 
     tail = (ev.get("text") or "")[-int(cfg.get("worker_tail_chars", 2000)):]
-    # 不再有轮次上限，所以不再写「还有 N 轮余量 / 这是最后一轮」。
-    # 那种话术只会让 orchestrator 在后期倾向于草率拍板或直接升级。
-    msg = (f"[RELAY {rounds + 1}] worker={worker} pane={pane} "
-           f"cwd={ev.get('cwd')} src={ev.get('src')} "
-           f"（该 worker 累计第 {rounds + 1} 次决策，仅作计数）\n"
-           f"--- worker 最后输出（末尾 {len(tail)} 字，可能被截断）---\n{tail}\n---\n"
-           f"先独立判断，不要跳过推理：\n"
-           f"  · 它到底卡在什么上？是缺决策，还是在等异步事件（备份/CI/Monitor）？\n"
-           f"  · 你的决定会影响什么？哪个选项可回滚？\n"
-           f"需要更多原文时，用 `relay context {worker} [行数]` 拉取，别靠猜。\n"
-           f"\n"
-           f"升级给人的判断标准（从严，默认用 decide）：\n"
-           f"  只在三种情况 escalate：\n"
-           f"    1) worker 在等 A / B 选择，而你没有办法从既有目标里判断；\n"
-           f"    2) 需要扩大授权——新的权限、新的范围、超出该任务既有授权的事；\n"
-           f"    3) 出现你无法判断后果的异常（数据损坏、状态不一致、越界操作）。\n"
-           f"  不要因为这些升级：\n"
-           f"    · 「信息不完整」。worker 正在推进、有连续输出、或在执行已授权步骤时，\n"
-           f"      它就是正常在工作，继续用 decide 让它往下走。\n"
-           f"    · 「涉及生产」。已授权任务*内*的生产操作不算扩大授权，不要再确认。\n"
-           f"    · 「保险起见」。人已经回答过的问题不要重复升级；同一个问题只升级一次。\n"
-           f"\n"
-           f"想清楚之后，发下面**其中一条**命令（格式要精确）：\n"
-           f"  relay decide {worker} \"<决策>\"\n"
-           f"  relay done {worker} \"<完成摘要>\"\n"
-           f"  relay escalate {worker} \"<背景 / 已尝试方案 / A|B|C 选项与推荐>\"\n"
-           f"decide 和 done 都会把这段文本发给 worker；两者都只改本地状态、不给 worker\n"
-           f"发文本的用法是 relay done {worker} \"\"。\n"
-           f"决策后把结论追加到 DECISIONS.md。")
+    # 派发文本在 templates/dispatch.txt 里，可直接编辑。
+    # 不再有轮次上限，所以模板里也没有「还有 N 轮余量 / 这是最后一轮」。
+    msg = render_template(
+        "dispatch", cfg,
+        round=rounds + 1, worker=worker, pane=pane,
+        cwd=ev.get("cwd"), src=ev.get("src"),
+        tail_chars=len(tail), tail=tail)
     if not paste(orch, msg):
         log(f"派发失败，事件保留在 {path}")
         return
@@ -1087,8 +1177,7 @@ def apply_outbox(state, cfg):
                             "决策命中 dangerous_regex（不可逆操作），拦截转人工", text)
                 continue
             caution = caution_note(cfg, text)
-            if not paste(pane, f"[决策] {text}\n{caution}\n"
-                               f"（这是 orchestrator 的决策，请据此继续。）"):
+            if not paste(pane, render_template("decide", cfg, text=text, caution=caution)):
                 retry_or_drop(path, cmd, tries, cfg, state, worker, pane,
                               "decide 回灌失败")
                 continue
@@ -1115,8 +1204,7 @@ def apply_outbox(state, cfg):
             # 一边被当成有内容 paste 出去，一边又被当成空文本跳过通知。
             has_text = bool(text.strip())
             if has_text and pane:
-                if not paste(pane, f"[已完成] {text}\n"
-                                   f"（orchestrator 认为本轮结束；如仍有指示，以上为准）"):
+                if not paste(pane, render_template("done", cfg, text=text)):
                     retry_or_drop(path, cmd, tries, cfg, state, worker, pane,
                                   "done 回灌失败")
                     continue
@@ -1139,7 +1227,7 @@ def apply_outbox(state, cfg):
             do_escalate(state, cfg, worker, pane, "orchestrator 请求人工决策", text)
 
         elif action == "answer":
-            if text and not paste(pane, f"[人工决策] {text}\n\n（这是人给出的决策，请据此继续。）"):
+            if text and not paste(pane, render_template("answer", cfg, text=text)):
                 retry_or_drop(path, cmd, tries, cfg, state, worker, pane,
                               "人工决策回灌失败")
                 continue
@@ -1164,7 +1252,7 @@ def caution_note(cfg, text):
     """
     pat = cfg.get("caution_regex") or ""
     if pat and re.search(pat, text, re.I):
-        return "\n[提示] 决策文本含部署/生产相关字样，已照常下达、未拦截。请自行确认不越权。"
+        return render_template("caution", cfg)
     return ""
 
 
@@ -1382,6 +1470,62 @@ def cmd_status():
     return 0
 
 
+def cmd_templates(argv):
+    """查看 / 导出提示词模板，方便直接编辑。
+
+    不带参数：列出每个模板的来源（内置 / 哪个文件）与占位符。
+    export：把内置默认写到 ~/.agent-relay/templates/，之后即可直接编辑。
+    show <kind>：打印某个模板的当前生效内容。
+    """
+    cfg = load_config()
+    action = argv[0] if argv else "list"
+
+    if action == "list":
+        print(f"模板目录: {TPL_DIR}")
+        if cfg.get("templates_dir"):
+            print(f"配置目录: {cfg['templates_dir']}（优先）")
+        print()
+        for kind in sorted(TEMPLATES):
+            path = _tpl_file(kind, cfg)
+            src = path if path else "(内置默认)"
+            print(f"  {kind:<10} {src}")
+        print("\n用 `relay templates export` 导出为可编辑文件，"
+              "`relay templates show <kind>` 查看当前生效内容。")
+        return 0
+
+    if action == "export":
+        ensure_dirs()
+        os.makedirs(TPL_DIR, exist_ok=True)
+        n = 0
+        for kind, text in TEMPLATES.items():
+            p = os.path.join(TPL_DIR, f"{kind}.txt")
+            if os.path.exists(p):
+                print(f"已存在，跳过: {p}")
+                continue
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(text if text.endswith("\n") else text + "\n")
+            print(f"已导出: {p}")
+            n += 1
+        print(f"\n共导出 {n} 个。编辑后 daemon 下一轮 tick 即生效（无需重启）。")
+        return 0
+
+    if action == "show":
+        kind = argv[1] if len(argv) > 1 else ""
+        if kind not in TEMPLATES:
+            print(f"未知模板: {kind!r}。可选: {', '.join(sorted(TEMPLATES))}",
+                  file=sys.stderr)
+            return 2
+        path = _tpl_file(kind, cfg)
+        print(f"# 来源: {path or '(内置默认)'}")
+        print("-" * 60)
+        print(TEMPLATES[kind] if not path else open(path, encoding="utf-8").read())
+        return 0
+
+    print(f"未知子命令: {action}\n用法: relay templates [list|export|show <kind>]",
+          file=sys.stderr)
+    return 2
+
+
 USAGE = """agent-relay — 多 agent tmux 编排中继
 
   relay init                       写入 ~/.agent-relay/config.json（在 orchestrator pane 中执行）
@@ -1394,6 +1538,7 @@ USAGE = """agent-relay — 多 agent tmux 编排中继
   relay escalate <worker> <text>   orchestrator: 升级给人
   relay answer <worker> [text]     人: 回灌决策 / 无 text 仅解除静默
   relay context <worker> [行数]    orchestrator: 拉取 worker 完整原文（只读）
+  relay templates [export|show]    查看/导出可直接编辑的提示词模板
   relay daemon                     常驻调度
   relay status                     查看状态
 """
@@ -1424,6 +1569,8 @@ def main():
         return cmd_register(rest)
     if cmd == "unregister":
         return cmd_unregister(rest)
+    if cmd == "templates":
+        return cmd_templates(rest)
     if cmd == "status":
         return cmd_status()
     print(f"未知命令: {cmd}\n\n{USAGE}", file=sys.stderr)

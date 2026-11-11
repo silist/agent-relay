@@ -18,6 +18,7 @@
   "skip_background_tasks": true,
   "pending_slack": 3600,
   "notify_done": true,
+  "templates_dir": "",
   "dangerous_regex": "rm\\s+-rf\\s+/|rm\\s+-rf\\s+~|(git\\s+push|push)\\s+.*(--force|-f)\\b|force.?push|drop\\s+(table|database|schema)|truncate\\s+table|git\\s+reset\\s+--hard|mkfs\\.|dd\\s+if=.*of=/dev/|>\\s*/dev/sd",
   "caution_regex": "deploy|部署|上线|发布|prod|production|线上|生产",
   "worker_tail_chars": 2000,
