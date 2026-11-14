@@ -25,7 +25,7 @@ worker 停下 ──┤ relay event（hook）                          │
               ▼                                      ▼
     paste 回 worker pane                    飞书 / 邮件通知人
                                                      │
-                                    人直接回复邮件 → 自动回灌
+                                    人直接回复邮件 → 自动回灌 orchestrator
 ```
 
 ## 为什么值得存在
@@ -225,6 +225,7 @@ codex 的全局 `developer_instructions` 仍保留一份精简的启动期注入
 | `dangerous_regex` | 见下 | 命中即**拦截**转人工 |
 | `caution_regex` | 见下 | 命中只**标注**，不拦截 |
 | `mail_reply_enabled` | `false` | 邮件回灌开关 |
+| `mail_reply_lookback_days` | `7` | 回灌扫描近几天邮件（含已读，用于补捞 Message-ID 曾为空的工单） |
 
 ### `dangerous_regex` 只该放不可逆操作
 
@@ -295,11 +296,14 @@ orchestrator 对它的空确认又一封——后者没有信息量。`notify_do
 
 ## 邮件回灌的验证
 
-`mail_reply_enabled: true` 后，直接回复升级邮件即可回灌。验证链：
+`mail_reply_enabled: true` 后，直接回复升级邮件即可回灌——**回灌给 orchestrator**，
+由它判断后发 `relay decide` / `done` / `escalate`。worker 的 `waiting_human` 状态
+不由邮件直接解除。验证链：
 
 ```
 1. From 精确等于白名单（parseaddr 全等，防 user@example.com.evil.com）
 2. In-Reply-To / References 命中本系统发出的那封升级邮件的 Message-ID
+   历史工单当时没捞到 ID 时：主题含工单号 + In-Reply-To 非空（指向原升级邮件）
 3. 该工单仍在 waiting_human（天然防重放）
 4. 正文非空、且不含其他待处理工单号
 ```
@@ -308,7 +312,12 @@ orchestrator 对它的空确认又一封——后者没有信息量。`notify_do
 同域自发邮件往往不做 SPF/DKIM 校验。`In-Reply-To` 由邮件客户端回复时自动带上，指向的
 Message-ID 只出现在发给你的那封信里，伪造者无从得知。
 
-实现上有个坑：QQ 会改写客户端设置的 `Message-ID`，所以只能发信后按主题把它捞回来存下。
+实现上有两个坑：
+- QQ 会改写客户端设置的 `Message-ID`，所以只能发信后按主题把它捞回来存下。
+  IMAP 落盘有延迟，捞取会重试若干次。
+- 若当时没捞到 Message-ID，回复邮件曾被误判为「无法校验来源」并标为已读，
+  永久丢失。现在扫描近 `mail_reply_lookback_days` 天的邮件（含已读），
+  以便修复后补捞。
 
 ## 状态目录
 

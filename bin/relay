@@ -6,6 +6,7 @@
   orchestrator 执行 relay decide|done|escalate --> outbox/
   daemon 应用 outbox：decide 回灌 worker；escalate 走飞书/邮件通知人
   人执行 relay answer <worker> [决策] --> 回灌 worker
+  人回复升级邮件 --> 回灌 orchestrator（由它判断再发 decide/done）
 """
 
 import json
@@ -59,6 +60,7 @@ DEFAULTS = {
     "escalate_tail_chars": 1500,
     "imap_poll_interval": 30,
     "mail_reply_enabled": False,
+    "mail_reply_lookback_days": 7,
     "templates_dir": "",
 }
 
@@ -115,6 +117,13 @@ TEMPLATES = {
     "done": "[已完成] {text}\n（orchestrator 认为本轮结束；如仍有指示，以上为准）",
     # 人工 answer 回灌给 worker
     "answer": "[人工决策] {text}\n\n（这是人给出的决策，请据此继续。）",
+    # 人对升级邮件的回复，转交 orchestrator（不是 worker）
+    "mail_reply": (
+        "[RELAY 邮件回复] worker={worker} 工单={token}\n"
+        "人对你的升级邮件做了回复，请据此判断，再按常规发 decide/done/escalate：\n"
+        "--- 人回复原文 ---\n{text}\n---\n"
+        "注意：该 worker 仍处于 waiting_human；是否、何时回灌由你决定。"
+    ),
     # 命中 caution_regex 时追加的提示（decide 模板里的 {caution}）
     "caution": "\n[提示] 决策文本含部署/生产相关字样，已照常下达、未拦截。请自行确认不越权。",
     # 升级给人的通知正文
@@ -389,7 +398,7 @@ def paste(pane, text):
 def find_sent_message_id(cfg, subject):
     """发信后捞回服务器实际分配的 Message-ID。
 
-    QQ 会改写客户端设置的 Message-ID（实测自定义值被替换成 tencent_xxx@qq.com），
+    QQ 会改写客户端设置的 Message-ID（实测自定义值被替换成服务端分配的地址），
     所以没法在发信前固定。只能发完再按主题找回来，供后续校验 In-Reply-To ——
     回复邮件的 In-Reply-To 指向的正是这个 ID，伪造者无从得知。
 
@@ -492,8 +501,15 @@ def notify(title, body):
                     s.send_message(msg)
                 log("邮件通知已发送")
                 ok = True
-                time.sleep(2)   # 等服务器落盘再捞
-                message_id = find_sent_message_id(cfg, title)
+                # QQ IMAP 落盘有延迟，2s 常常捞不到（真实事故：T81B5973AEB
+                # 的升级信发出 3s 后仍查不到 Message-ID，回复因此被判为
+                # 「无法校验来源」）。短间隔重试，失败也只浪费几秒。
+                for attempt in range(6):
+                    message_id = find_sent_message_id(cfg, title)
+                    if message_id:
+                        break
+                    if attempt < 5:
+                        time.sleep(3)
                 if message_id:
                     log(f"已记录 Message-ID: {message_id}")
                 else:
@@ -603,18 +619,26 @@ def plain_body(msg):
 
 
 def poll_mail(state, cfg):
-    """把人对升级邮件的回复回灌给 worker。
+    """把人对升级邮件的回复回灌给 orchestrator（不是 worker）。
+
+    邮件是 orchestrator 通过 relay escalate 发出的，人回复的是 orchestrator
+    抛出的 A/B 选项，理应由 orchestrator 接着判断、再决定如何回灌 worker。
+    曾直接回灌给 worker，等于跳过 orchestrator 的判断。
 
     验证链（全部通过才受理）：
       1. From 精确等于白名单（parseaddr 全等，防 user@example.com.evil.com）
       2. In-Reply-To / References 命中本系统发出的那封升级邮件
          —— 这是主判据。Message-ID 由 QQ 分配、只出现在发给你那封信的
-            In-Reply-To 里，伪造者不知道；而正常回复邮件客户端会自动带上。
-      3. 该工单仍在 waiting_human（自然防重放：受理后状态即变）
+            In-Reply-To 里，伪造者不知道；正常回复邮件客户端会自动带上。
+         历史工单当时没捞到 Message-ID 时，回退到「主题含工单号 +
+         In-Reply-To 指向另一封邮件（即原升级邮件）」：伪造者仍不知道
+         那封原邮件的 Message-ID，安全性不降级。
+      3. 该工单仍在 waiting_human（天然防重放：受理后状态即变）
       4. 正文非空、且不含其他待处理工单号（防串台）
 
-    注意 In-Reply-To 必须优先于工单号匹配：回复邮件的正文和主题都会带着
-    引用回来的原文，那里也有工单号，用「正文含工单号」判会误受理。
+    收件范围包括近期 SEEN 的邮件：Message-ID 捞取失败时 daemon 会把原邮件
+    标为已读，修复后需要能补扫回来，否则回复永久丢失。用 SINCE 限定窗口，
+    避免每轮扫全邮箱。
     """
     e = cfg.get("email") or {}
     allow = [a.strip().lower() for a in (e.get("from_whitelist") or []) if a.strip()]
@@ -628,6 +652,8 @@ def poll_mail(state, cfg):
     by_mid = {st["escalation_message_id"].strip(): w for w, st in pending.items()
               if st.get("escalation_message_id")}
     tokens_lower = {w: st["reply_token"].lower() for w, st in pending.items()}
+    # 工单号 -> worker，用于历史缺 mid 的兜底校验
+    by_token = {st["reply_token"].lower(): w for w, st in pending.items()}
 
     m = None
     try:
@@ -635,32 +661,58 @@ def poll_mail(state, cfg):
         if m is None:
             return
         m.select("INBOX")
-        typ, data = m.search(None, '(UNSEEN SUBJECT "[relay]")')
+        # 只看近 N 天的 [relay] 邮件；含 SEEN 是为了捞回「mid 曾为空、
+        # 被误标已读」的邮件。IMAP 的 OR 复合检索在 QQ 上极易超时，
+        # 用一条简单的 SINCE + SUBJECT 即可覆盖 UNSEEN 与 SEEN。
+        days = max(1, int(cfg.get("mail_reply_lookback_days", 7)))
+        since = time.strftime("%d-%b-%Y", time.gmtime(time.time() - days * 86400))
+        typ, data = m.search(None, f'(SINCE {since} SUBJECT "[relay]")')
         for num in (data[0].split() if typ == "OK" else []):
-            typ, d = m.fetch(num, "(RFC822)")
+            typ, d = m.fetch(num, "(BODY.PEEK[HEADER.FIELDS (SUBJECT MESSAGE-ID IN-REPLY-TO FROM)])")
+            if typ != "OK" or not d or not d[0]:
+                continue
             import email as _email
-            msg = _email.message_from_bytes(d[0][1])
-
+            hdr = _email.message_from_bytes(d[0][1])
+            subj = header_raw_text(hdr)
+            # 只处理人的回复（"回复：[relay] ..."），不重复处理升级原邮件
+            if not subj.lower().lstrip().startswith(("回复:", "回复：", "re:")):
+                continue
             from email.utils import parseaddr
-            sender = parseaddr(str(msg.get("From") or ""))[1].strip().lower()
+            sender = parseaddr(str(hdr.get("From") or ""))[1].strip().lower()
             frm = next((a for a in allow if a == sender), "")
             if not frm:
                 log(f"邮件回灌：发件人不在白名单，忽略。From={sender or '(空)'}")
-                m.store(num, "+FLAGS", "\\Seen")
                 continue
 
-            refs = " ".join(str(msg.get(h) or "")
+            refs = " ".join(str(hdr.get(h) or "")
                             for h in ("In-Reply-To", "References"))
-            worker = next((w for mid, w in by_mid.items() if mid in refs), None)
+            worker = next((w for mid, w in by_mid.items() if mid and mid in refs), None)
+            matched_by = "In-Reply-To"
+            if worker is None:
+                # 历史工单：当时没记下 Message-ID。主题里带工单号，
+                # 且回复的 In-Reply-To 指向「另一封」邮件（不是回复自身），
+                # 才认。空 In-Reply-To 或自引用不认，防跨工单串台。
+                reply_mid = str(hdr.get("Message-ID") or "").strip()
+                for token, w in by_token.items():
+                    if token in subj.lower() and refs.strip() and \
+                            (not reply_mid or reply_mid not in refs):
+                        worker = w
+                        matched_by = "工单号+In-Reply-To"
+                        break
             if worker is None:
                 hint = ("该邮件不是对任何未结升级邮件的回复"
                         if by_mid else
                         "当前没有记录到升级邮件的 Message-ID，无法校验回复来源")
                 log(f"邮件回灌：{hint}，忽略。In-Reply-To="
-                    f"{str(msg.get('In-Reply-To') or '(空)')[:80]}")
+                    f"{str(hdr.get('In-Reply-To') or '(空)')[:80]}")
                 m.store(num, "+FLAGS", "\\Seen")
                 continue
 
+            # 需要正文时才拉完整邮件，减少 IMAP 传输
+            typ, full = m.fetch(num, "(RFC822)")
+            if typ != "OK" or not full or not full[0]:
+                continue
+            msg = _email.message_from_bytes(full[0][1])
             body = plain_body(msg)
             if not body:
                 log(f"邮件回灌：{worker} 的邮件正文为空，忽略")
@@ -672,13 +724,17 @@ def poll_mail(state, cfg):
                 m.store(num, "+FLAGS", "\\Seen")
                 continue
 
+            # 写 outbox，由 daemon 统一投递给 orchestrator；不直接改 state，
+            # 不碰 worker 的 waiting_human——是否需要回灌由 orchestrator 决定。
             ms = int(time.time() * 1000)
-            save_json(os.path.join(OUTBOX, f"{ms:013d}-answer.json"),
-                      {"action": "answer", "worker": worker, "text": body,
-                       "src": "email", "from": frm, "ts": ms / 1000})
+            token = next((t for t, w in by_token.items() if w == worker), "")
+            save_json(os.path.join(OUTBOX, f"{ms:013d}-mailreply.json"),
+                      {"action": "reply_orch", "worker": worker, "token": token,
+                       "text": body, "src": "email", "from": frm,
+                       "ts": ms / 1000})
             m.store(num, "+FLAGS", "\\Seen")
-            log(f"邮件回灌：已受理 {frm} 对 {worker} 的回复（{len(body)} 字，"
-                f"In-Reply-To 命中）")
+            log(f"邮件回灌：已受理 {frm} 对 {worker} 的回复"
+                f"（{len(body)} 字，{matched_by}），转交 orchestrator")
     except Exception as exc:
         log(f"邮件回灌轮询失败: {exc}")
     finally:
@@ -1275,6 +1331,21 @@ def apply_outbox(state, cfg):
             save_state(state)
             os.unlink(path)
             log(f"{worker}: 已{'回灌人决策' if text else '解除静默'}")
+
+        elif action == "reply_orch":
+            # 邮件回复属于 orchestrator：它发出的升级邮件，由它接着判断。
+            # 不改 worker 状态——是否回灌、何时回灌由 orchestrator 决定。
+            orch = resolve_pane(cfg.get("orchestrator_pane") or "")
+            if not orch:
+                log(f"邮件回复 {worker} 暂留 outbox：orchestrator pane 解析不到")
+                continue
+            msg = render_template("mail_reply", cfg, worker=worker,
+                                  token=cmd.get("token", ""), text=text)
+            if not paste(orch, msg):
+                log(f"邮件回复 {worker} 投递 orchestrator 失败，保留重试")
+                continue
+            os.unlink(path)
+            log(f"邮件回复 {worker} 已转交 orchestrator（{len(text)} 字）")
 
         else:
             log(f"未知 action={action}，丢弃 {path}")

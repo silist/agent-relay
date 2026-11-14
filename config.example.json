@@ -24,5 +24,6 @@
   "worker_tail_chars": 2000,
   "escalate_tail_chars": 1500,
   "imap_poll_interval": 30,
-  "mail_reply_enabled": false
+  "mail_reply_enabled": false,
+  "mail_reply_lookback_days": 7
 }

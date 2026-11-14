@@ -4,6 +4,15 @@
 
 ### 修复
 
+- **邮件回复回灌给 orchestrator 而不是 worker**。升级邮件是 orchestrator 发的，人回复的
+  是它抛出的 A/B 选项；直接塞给 worker 等于跳过 orchestrator 的判断。现在回复写成
+  `reply_orch` outbox 指令，daemon paste 给 orchestrator pane，worker 状态不变。
+- **升级邮件的 Message-ID 捞取改为重试**。QQ IMAP 落盘延迟让原来的单次 2 秒等待经常
+  失败（`T81B5973AEB` 工单因此无法接受邮件回复）；现在短间隔重试 6 次。
+- **已读邮件也能补捞**。Message-ID 缺失时回复邮件曾被标 `\Seen` 后永久跳过；现在按
+  `mail_reply_lookback_days` 扫近几天邮件（含已读），历史缺 ID 的工单用「主题工单号 +
+  In-Reply-To 非空」兜底校验，安全性不降级。
+
 - **pane 用稳定目标而不是 `%N`**。tmux server 重启后 pane 编号会重排，配置里存的
   `%3` 变成无效 target，daemon 每秒重试同一件事、事件永远派不出去。现在
   `orchestrator_pane` / `worker_panes` 都存 `session:window.pane`，使用时再解析。
